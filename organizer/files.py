@@ -465,8 +465,8 @@ def _iter_files(folder: Path, recursive: bool) -> Iterator[Path]:
 def _occupied(path: Path) -> bool:
     """Vrai si quelque chose occupe déjà `path`.
 
-    Une erreur autre que « absent » (nom trop long, dossier interdit) signifie
-    que l'emplacement est inutilisable : elle remonte au lieu de laisser croire
+    Une erreur autre que « absent » (dossier interdit) signifie que
+    l'emplacement est inutilisable : elle remonte au lieu de laisser croire
     que la place est libre.
     """
     try:
@@ -475,16 +475,47 @@ def _occupied(path: Path) -> bool:
         raise OSError(f"L'emplacement « {path} » est inutilisable : {error}") from error
 
 
+# Longueur maximale d'un nom de fichier ou de dossier : 255 unités UTF-16 sous
+# Windows (NTFS, exFAT), 255 octets ailleurs (ext4, APFS).
+MAX_NAME_LENGTH = 255
+
+
+def _name_length(name: str) -> int:
+    if os.name == "nt":
+        return len(name.encode("utf-16-le")) // 2
+    return len(os.fsencode(name))
+
+
+def _check_name_lengths(path: Path) -> None:
+    """Refuse un chemin dont un composant dépasse la limite du système de fichiers.
+
+    `_occupied` ne peut pas s'en apercevoir partout : sous Windows,
+    `Path.exists()` répond « absent » à un nom trop long au lieu de lever une
+    erreur, et la place paraîtrait libre.
+    """
+    for part in path.parts:
+        if _name_length(part) > MAX_NAME_LENGTH:
+            raise OSError(
+                f"L'emplacement « {path} » est inutilisable : le nom « {part[:40]}… » "
+                f"dépasse {MAX_NAME_LENGTH} caractères."
+            )
+
+
 def _free_path(folder: Path, name: str, claimed: set[str]) -> Path:
     """Chemin libre dans `folder` : « nom (2).ext », « nom (3).ext »… si besoin.
 
     `claimed` retient les cibles déjà réservées par le lot en cours, pour que deux
-    fichiers différents ne visent jamais le même chemin final.
+    fichiers différents ne visent jamais le même chemin final. Chaque candidat
+    est contrôlé : le suffixe « (2) » peut faire dépasser la limite à un nom
+    qui la frôlait.
     """
     candidate = folder / name
     stem, suffix = candidate.stem, candidate.suffix
     index = 2
-    while _claim_key(candidate) in claimed or _occupied(candidate):
+    while True:
+        _check_name_lengths(candidate)
+        if _claim_key(candidate) not in claimed and not _occupied(candidate):
+            break
         candidate = folder / f"{stem} ({index}){suffix}"
         index += 1
     claimed.add(_claim_key(candidate))

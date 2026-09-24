@@ -640,6 +640,82 @@ def test_plan_ecarte_un_seul_fichier_dont_la_destination_est_inutilisable(conn, 
     assert "inutilisable" in organizer.last_failures[0][1]
 
 
+@pytest.fixture()
+def stat_facon_windows(monkeypatch):
+    """Reproduit Windows : un nom invalide y est « absent » au lieu de lever une erreur.
+
+    Python y compte ERROR_INVALID_NAME parmi les erreurs à ignorer : `exists()`
+    et `is_symlink()` répondent `False` là où Linux lève ENAMETOOLONG. Sans ce
+    montage, la suite passe sous Linux sur un code qui échoue sous Windows.
+    """
+    for nom in ("exists", "is_symlink"):
+        origine = getattr(Path, nom)
+
+        def silencieux(self, *args, _origine=origine, **kwargs):
+            try:
+                return _origine(self, *args, **kwargs)
+            except OSError:
+                return False
+
+        monkeypatch.setattr(Path, nom, silencieux)
+
+
+@pytest.mark.parametrize("racine_existe", [True, False])
+def test_plan_ecarte_un_nom_trop_long_meme_si_exists_ne_leve_rien(
+    conn, tmp_path, root, stat_facon_windows, racine_existe
+):
+    """Sous Windows, le plan proposait le fichier vers un dossier impossible à
+    créer, faute d'erreur levée par `exists()`."""
+    source = tmp_path / "Entrée"
+    _write(source / "facture.pdf")
+    _write(source / "photo.jpg")
+    if racine_existe:
+        root.mkdir(parents=True)
+    organizer = FileOrganizer(conn, [Rule("Trop long", "A" * 300, ["pdf"]), *DEFAULT_RULES], root)
+
+    moves = organizer.plan(source)
+
+    assert [move.src.name for move in moves] == ["photo.jpg"]
+    assert [chemin.name for chemin, _ in organizer.last_failures] == ["facture.pdf"]
+    assert "inutilisable" in organizer.last_failures[0][1]
+
+
+def test_le_suffixe_de_collision_ne_fait_pas_depasser_la_limite(tmp_path, stat_facon_windows):
+    """« nom (2).pdf » dépasse la limite quand « nom.pdf » l'atteignait tout juste.
+
+    La place est prise via `claimed`, pour ne pas avoir à créer sur le disque un
+    fichier au nom de 255 caractères.
+    """
+    nom = "a" * (module_files.MAX_NAME_LENGTH - len(".pdf")) + ".pdf"
+    dossier = tmp_path / "PDF"
+    claimed = {module_files._claim_key(dossier / nom)}
+
+    with pytest.raises(OSError, match="inutilisable"):
+        module_files._free_path(dossier, nom, claimed)
+
+
+def test_un_nom_a_la_limite_reste_accepte(tmp_path):
+    nom = "a" * (module_files.MAX_NAME_LENGTH - len(".pdf")) + ".pdf"
+    assert module_files._free_path(tmp_path, nom, set()) == tmp_path / nom
+
+
+@pytest.mark.parametrize(
+    ("nom", "sous_windows", "ailleurs"),
+    [
+        ("a" * 10, 10, 10),
+        ("é" * 200, 200, 400),  # une unité UTF-16, deux octets UTF-8
+        ("😀" * 10, 20, 40),  # hors du plan de base : paire de substitution, quatre octets
+    ],
+)
+def test_longueur_de_nom_selon_le_systeme(monkeypatch, nom, sous_windows, ailleurs):
+    """NTFS compte en unités UTF-16, ext4 en octets : 200 « é » passent sous
+    Windows et pas sous Linux."""
+    monkeypatch.setattr(module_files.os, "name", "nt")
+    assert module_files._name_length(nom) == sous_windows
+    monkeypatch.setattr(module_files.os, "name", "posix")
+    assert module_files._name_length(nom) == ailleurs
+
+
 def test_iter_files_ecarte_les_dossiers_caches_par_attribut(tmp_path, monkeypatch):
     """Constat 16 : le parcours récursif n'écartait que les dossiers commençant
     par un point, convention sans effet sous Windows (AppData, $RECYCLE.BIN)."""
