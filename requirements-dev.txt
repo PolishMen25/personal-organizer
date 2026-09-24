@@ -1,0 +1,6 @@
+# Outils de développement : tests et fabrication de l'exécutable Windows.
+-r requirements.txt
+
+pytest>=8.0
+# packaging/organizer.spec utilise l'API des specs de PyInstaller 6.
+pyinstaller>=6.3

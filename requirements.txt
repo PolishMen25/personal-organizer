@@ -1,0 +1,3 @@
+# Dépendances d'exécution : Qt pour Python, et rien d'autre.
+# Tout le reste de l'application tient dans la bibliothèque standard.
+PySide6>=6.6
