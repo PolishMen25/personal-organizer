@@ -582,7 +582,10 @@ def _check_path_lengths(path: Path) -> None:
                     f"{MAX_PATH - 1} caractères. Raccourcissez le nom du fichier ou la "
                     "destination de la règle, ou activez les chemins longs de Windows."
                 )
-            if _name_length(os.path.dirname(full)) >= MAX_DIRECTORY_PATH:
+            directory = os.path.dirname(full)
+            # La limite de 248 vaut pour CRÉER un dossier : dans un dossier qui
+            # existe déjà, seul compte le chemin complet.
+            if _name_length(directory) >= MAX_DIRECTORY_PATH and not os.path.isdir(directory):
                 raise OSError(
                     f"L'emplacement « {path} » est inutilisable : le dossier de destination "
                     f"dépasse {MAX_DIRECTORY_PATH - 1} caractères."

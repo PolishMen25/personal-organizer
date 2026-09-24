@@ -756,6 +756,20 @@ def test_chemin_au_dela_des_limites_refuse(windows_sans_chemins_longs, dossier, 
         module_files._check_path_lengths(_chemin(dossier, fichier))
 
 
+def test_dossier_existant_au_dela_de_248_accepte(windows_sans_chemins_longs, monkeypatch):
+    """La limite de 248 vaut pour CRÉER un dossier ; un fichier se crée dans un
+    dossier existant tant que le chemin complet reste sous 260.
+
+    L'existence est simulée : sans chemins longs, Windows refuserait justement
+    de créer ce dossier pour le test.
+    """
+    chemin = _chemin(250, 5)
+    dossier = os.path.dirname(os.path.abspath(chemin))
+    vrai_isdir = os.path.isdir
+    monkeypatch.setattr(module_files.os.path, "isdir", lambda p: os.fspath(p) == dossier or vrai_isdir(p))
+    module_files._check_path_lengths(chemin)
+
+
 def test_chemins_longs_actives_levent_la_limite(monkeypatch):
     monkeypatch.setattr(module_files, "_windows", lambda: True)
     monkeypatch.setattr(module_files, "_long_paths_enabled", lambda: True)
