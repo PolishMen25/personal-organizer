@@ -9,6 +9,7 @@ supprimé, et le dernier rangement reste annulable.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from collections.abc import Callable
@@ -1056,10 +1057,14 @@ class FilesTab(QWidget):
         if not raw:
             self._set_error(status, "Choisissez d'abord un dossier.")
             return None
-        folder = Path(raw).expanduser()
+        # Absolu dès la saisie : « \Users\Jean\Downloads » dépend sinon du lecteur
+        # courant, qui change selon la façon dont l'application est lancée.
+        folder = Path(os.path.abspath(Path(raw).expanduser()))
         if not folder.is_dir():
             self._set_error(status, f"Le dossier « {folder} » est introuvable.")
             return None
+        if str(folder) != raw:
+            self._folder_edit.setText(str(folder))
         self._remember_folder(folder)
         return folder
 

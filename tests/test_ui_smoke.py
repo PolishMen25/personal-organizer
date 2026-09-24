@@ -28,7 +28,7 @@ from organizer import files as module_files
 from organizer.context import AppContext
 from organizer.tasks import PRIORITY_HIGH
 from organizer.timer import Phase
-from organizer.ui.files_tab import FOLDER_PLACEHOLDER, FilesTab
+from organizer.ui.files_tab import FOLDER_PLACEHOLDER, LAST_FOLDER_KEY, FilesTab
 from organizer.ui import focus_tab as module_focus
 from organizer.ui.focus_tab import FocusTab
 from organizer.ui.main_window import MainWindow
@@ -436,6 +436,26 @@ def test_dossier_introuvable_affiche_une_erreur(
     assert "introuvable" in files._plan_status.text()
     assert files._plan == []
     assert ctx.files.batches() == []
+
+
+def test_dossier_relatif_rendu_absolu_et_memorise(
+    window: MainWindow, ctx: AppContext, tmp_path: Path, pump, monkeypatch
+) -> None:
+    """Un dossier relatif dépend du dossier courant, qui change selon la façon
+    dont l'application est lancée : il est rendu absolu dès la saisie, et c'est
+    la forme absolue qui est affichée et mémorisée."""
+    dossier = _dossier_de_test(tmp_path)
+    monkeypatch.chdir(dossier.parent)
+    files = _onglet(window, FilesTab)
+    champ = _champ(files, FOLDER_PLACEHOLDER)
+    champ.setText(dossier.name)
+    _cliquer(_bouton(files, "Analyser"))
+    _attendre_fichiers(files, pump)
+    pump()
+
+    assert champ.text() == str(dossier)
+    assert ctx.settings.get(LAST_FOLDER_KEY) == str(dossier)
+    assert files._plan and all(move.src.is_absolute() for move in files._plan)
 
 
 # -- Navigation et fermeture ---------------------------------------------

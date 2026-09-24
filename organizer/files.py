@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from fnmatch import fnmatchcase
+from functools import cache
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from uuid import uuid4
@@ -126,12 +127,23 @@ def _clean_destination(destination: str, rule_name: str) -> str:
     pure = PureWindowsPath(raw)
     if pure.drive or pure.root:
         raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » doit être un chemin relatif.")
-    parts = [part for part in pure.parts if part != "."]
+    # Win32 retire les espaces et les points finaux du DERNIER segment seulement :
+    # « Documents / Factures » créerait « Documents », puis chercherait
+    # « Documents \ Factures » et échouerait pour chaque fichier de la règle.
+    # Les espaces, saisie naturelle autour d'un « / », sont donc retirées ici.
+    parts = [part.strip() for part in pure.parts if part.strip() != "."]
     if any(part == ".." for part in parts):
         raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » ne peut pas contenir « .. ».")
+    if any(not part for part in parts):
+        raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » contient un dossier sans nom.")
     if not parts:
         raise ValueError(f"Règle « {rule_name} » : la destination ne peut pas être vide.")
     for part in parts:
+        if part.endswith("."):
+            raise ValueError(
+                f"Règle « {rule_name} » : la destination « {raw} » ne peut pas contenir « {part} » : "
+                "Windows ne conserve pas le point final d'un nom de dossier."
+            )
         _check_part(part, raw, rule_name)
     return "/".join(parts)
 
@@ -428,6 +440,25 @@ def _size(path: Path) -> int:
         return 0
 
 
+def _moved_despite_error(source: Path, destination: Path, size: int) -> bool:
+    """Vrai seulement si le déplacement est PROUVÉ malgré l'erreur levée.
+
+    Une source qui ne répond plus n'a pas forcément disparu : clé USB retirée,
+    partage réseau coupé. Conclure au succès sur ce seul indice garderait une
+    copie tronquée sous le nom canonique, journalisée comme réussie, et
+    l'annulation serait ensuite refusée sans fin. Il faut donc que la
+    destination ait la taille relevée avant le déplacement, et que le dossier
+    source soit lisible et ne contienne plus le fichier.
+    """
+    if not _is_regular(destination) or _size(destination) != size:
+        return False
+    try:
+        names = os.listdir(source.parent)
+    except OSError:
+        return False  # dossier injoignable : l'absence de la source n'est pas prouvée
+    return source.name not in names
+
+
 def _discard(path: Path) -> None:
     """Efface un reste de copie inachevée ; l'échec ne doit rien interrompre."""
     try:
@@ -436,8 +467,19 @@ def _discard(path: Path) -> None:
         pass
 
 
+def _absolute(path: str | Path) -> Path:
+    """Chemin absolu, sans résoudre liens ni jonctions.
+
+    Le journal doit désigner le même endroit quel que soit le dossier courant au
+    moment de l'annulation. Sous Windows, « \\Users\\Jean » et « C:Downloads »
+    ont l'air absolus mais ne le sont pas : ils dépendent du lecteur ou du
+    dossier courant.
+    """
+    return Path(os.path.abspath(path))
+
+
 def _existing_folder(folder: str | Path) -> Path:
-    path = Path(folder)
+    path = _absolute(folder)
     if not path.is_dir():
         raise ValueError(f"Le dossier « {path} » est introuvable.")
     return path
@@ -478,27 +520,77 @@ def _occupied(path: Path) -> bool:
 # Longueur maximale d'un nom de fichier ou de dossier : 255 unités UTF-16 sous
 # Windows (NTFS, exFAT), 255 octets ailleurs (ext4, APFS).
 MAX_NAME_LENGTH = 255
+# Sans prise en charge des chemins longs, réglage par défaut de Windows 10 et 11 :
+# un chemin complet doit rester sous MAX_PATH, un dossier à créer sous 248.
+MAX_PATH = 260
+MAX_DIRECTORY_PATH = 248
+
+
+def _windows() -> bool:
+    return os.name == "nt"
 
 
 def _name_length(name: str) -> int:
-    if os.name == "nt":
-        return len(name.encode("utf-16-le")) // 2
+    if _windows():
+        # « surrogatepass » : NTFS accepte une moitié d'emoji isolée, qu'un
+        # navigateur laisse en tronquant un nom ; `listdir` la rend telle quelle.
+        return len(name.encode("utf-16-le", "surrogatepass")) // 2
     return len(os.fsencode(name))
 
 
-def _check_name_lengths(path: Path) -> None:
-    """Refuse un chemin dont un composant dépasse la limite du système de fichiers.
+@cache
+def _long_paths_enabled() -> bool:
+    """Vrai si ce processus peut dépasser MAX_PATH.
+
+    Il faut à la fois le réglage système LongPathsEnabled et un exécutable
+    déclaré longPathAware ; `RtlAreLongPathsEnabled` combine les deux. Dans le
+    doute, la limite classique s'applique : mieux vaut un refus au plan qu'un
+    échec au rangement.
+    """
+    if not _windows():
+        return True
+    try:
+        import ctypes
+
+        function = ctypes.WinDLL("ntdll").RtlAreLongPathsEnabled
+        function.argtypes = []
+        function.restype = ctypes.c_ubyte  # BOOLEAN : un seul octet significatif
+        return bool(function())
+    except (AttributeError, OSError):
+        return False
+
+
+def _check_path_lengths(path: Path) -> None:
+    """Refuse un chemin que le système de fichiers ne pourrait pas créer.
 
     `_occupied` ne peut pas s'en apercevoir partout : sous Windows,
-    `Path.exists()` répond « absent » à un nom trop long au lieu de lever une
-    erreur, et la place paraîtrait libre.
+    `Path.exists()` répond « absent » à un nom ou un chemin trop long au lieu de
+    lever une erreur, et la place paraîtrait libre.
     """
-    for part in path.parts:
-        if _name_length(part) > MAX_NAME_LENGTH:
-            raise OSError(
-                f"L'emplacement « {path} » est inutilisable : le nom « {part[:40]}… » "
-                f"dépasse {MAX_NAME_LENGTH} caractères."
-            )
+    try:
+        for part in path.parts:
+            if _name_length(part) > MAX_NAME_LENGTH:
+                raise OSError(
+                    f"L'emplacement « {path} » est inutilisable : le nom « {part[:40]}… » "
+                    f"dépasse {MAX_NAME_LENGTH} caractères."
+                )
+        if _windows() and not _long_paths_enabled():
+            full = os.path.abspath(path)
+            if _name_length(full) >= MAX_PATH:
+                raise OSError(
+                    f"L'emplacement « {path} » est inutilisable : le chemin complet dépasse "
+                    f"{MAX_PATH - 1} caractères. Raccourcissez le nom du fichier ou la "
+                    "destination de la règle, ou activez les chemins longs de Windows."
+                )
+            if _name_length(os.path.dirname(full)) >= MAX_DIRECTORY_PATH:
+                raise OSError(
+                    f"L'emplacement « {path} » est inutilisable : le dossier de destination "
+                    f"dépasse {MAX_DIRECTORY_PATH - 1} caractères."
+                )
+    except UnicodeError as error:
+        # Une ValueError ne serait pas rattrapée par `plan()` : l'analyse de tout
+        # le dossier s'arrêterait, au lieu d'écarter ce seul fichier.
+        raise OSError(f"L'emplacement « {path} » est inutilisable : nom illisible ({error}).") from error
 
 
 def _free_path(folder: Path, name: str, claimed: set[str]) -> Path:
@@ -513,7 +605,7 @@ def _free_path(folder: Path, name: str, claimed: set[str]) -> Path:
     stem, suffix = candidate.stem, candidate.suffix
     index = 2
     while True:
-        _check_name_lengths(candidate)
+        _check_path_lengths(candidate)
         if _claim_key(candidate) not in claimed and not _occupied(candidate):
             break
         candidate = folder / f"{stem} ({index}){suffix}"
@@ -582,7 +674,7 @@ class FileOrganizer:
     ):
         self.conn = conn
         self.rules = list(rules)
-        self.target_root = Path(target_root) if target_root is not None else Path.home()
+        self.target_root = _absolute(target_root if target_root is not None else Path.home())
         # Échecs (chemin, message) du dernier `apply()` ou `undo()`, à montrer à l'utilisateur.
         self.last_failures: list[tuple[Path, str]] = []
 
@@ -639,6 +731,11 @@ class FileOrganizer:
                 break  # ce qui est déjà déplacé reste journalisé, donc annulable
             source = Path(move.src)
             progress.step(f"Rangement de « {source.name} »", index, len(moves))
+            if not (source.is_absolute() and Path(move.dst).is_absolute()):
+                # Un chemin relatif journalisé serait résolu à l'annulation contre un
+                # autre dossier courant, et le fichier partirait ailleurs.
+                self.last_failures.append((source, "chemin relatif refusé : il rendrait l'annulation incertaine"))
+                continue
             try:
                 destination = self._move_file(source, Path(move.dst), claimed)
             except OSError as error:
@@ -654,15 +751,17 @@ class FileOrganizer:
         # La cible a pu apparaître depuis le plan : on renomme plutôt que d'écraser.
         destination = _free_path(destination.parent, destination.name, claimed)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        size = _size(source)
         try:
             shutil.move(str(source), str(destination))
         except OSError:
-            if _is_regular(destination) and not _is_regular(source):
-                return destination  # le déplacement a eu lieu malgré l'erreur
+            if _moved_despite_error(source, destination, size):
+                return destination
             # Vers un autre volume, `shutil.move` copie puis supprime : une copie
             # interrompue laisserait à destination un fichier tronqué portant le
             # nom canonique. `_free_path` a garanti que la place était libre,
             # donc ce qui s'y trouve vient de cette copie et doit disparaître.
+            # L'original, lui, n'a pas été supprimé.
             _discard(destination)
             raise
         return destination

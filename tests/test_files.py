@@ -710,10 +710,234 @@ def test_un_nom_a_la_limite_reste_accepte(tmp_path):
 def test_longueur_de_nom_selon_le_systeme(monkeypatch, nom, sous_windows, ailleurs):
     """NTFS compte en unités UTF-16, ext4 en octets : 200 « é » passent sous
     Windows et pas sous Linux."""
-    monkeypatch.setattr(module_files.os, "name", "nt")
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
     assert module_files._name_length(nom) == sous_windows
-    monkeypatch.setattr(module_files.os, "name", "posix")
+    monkeypatch.setattr(module_files, "_windows", lambda: False)
     assert module_files._name_length(nom) == ailleurs
+
+
+# --- Longueur des chemins sous Windows sans chemins longs ---------------------
+
+
+@pytest.fixture()
+def windows_sans_chemins_longs(monkeypatch):
+    """Réglage par défaut de Windows 10 et 11 : LongPathsEnabled vaut 0."""
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
+    monkeypatch.setattr(module_files, "_long_paths_enabled", lambda: False)
+
+
+def _chemin(dossier: int, fichier: int) -> Path:
+    """Chemin absolu dont le dossier fait `dossier` caractères et le nom `fichier`.
+
+    La racine vient d'`abspath` : « / », ou « D:\\ » sous Windows, où un « / »
+    seul recevrait la lettre du lecteur courant et décalerait les bornes.
+    """
+    racine = os.path.abspath(os.sep)
+    return Path(racine + "d" * (dossier - len(racine))) / ("f" * fichier)
+
+
+@pytest.mark.parametrize(
+    ("dossier", "fichier"),
+    [(200, 58), (247, 5)],  # 259 caractères au total ; dossier de 247
+)
+def test_chemin_juste_sous_les_limites_accepte(windows_sans_chemins_longs, dossier, fichier):
+    module_files._check_path_lengths(_chemin(dossier, fichier))
+
+
+@pytest.mark.parametrize(
+    ("dossier", "fichier", "motif"),
+    [
+        (200, 59, "chemin complet"),  # 260 caractères : MAX_PATH atteint
+        (248, 5, "dossier de destination"),  # CreateDirectoryW refuse 248 et plus
+    ],
+)
+def test_chemin_au_dela_des_limites_refuse(windows_sans_chemins_longs, dossier, fichier, motif):
+    with pytest.raises(OSError, match=motif):
+        module_files._check_path_lengths(_chemin(dossier, fichier))
+
+
+def test_chemins_longs_actives_levent_la_limite(monkeypatch):
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
+    monkeypatch.setattr(module_files, "_long_paths_enabled", lambda: True)
+    module_files._check_path_lengths(_chemin(248, 59))
+
+
+def test_plan_ecarte_une_destination_au_dela_de_max_path(conn, tmp_path, root, windows_sans_chemins_longs):
+    """Chaque composant tient sous 255, mais le chemin complet dépasse 259 : sous
+    Windows par défaut, le dossier ne pourra pas être créé. `exists()` y répond
+    « absent » plutôt que de lever, donc seul un contrôle explicite l'aperçoit."""
+    source = tmp_path / "Entrée"
+    long_nom = "r" * 100 + ".pdf"
+    _write(source / long_nom)
+    _write(source / "photo.jpg")
+    organizer = FileOrganizer(conn, [Rule("Profond", "D" * 150, ["pdf"]), *DEFAULT_RULES], root)
+
+    moves = organizer.plan(source)
+
+    assert [move.src.name for move in moves] == ["photo.jpg"]
+    assert [chemin.name for chemin, _ in organizer.last_failures] == [long_nom]
+    assert "chemin complet" in organizer.last_failures[0][1]
+
+
+# --- Noms contenant une moitié d'emoji isolée ----------------------------------
+
+
+def test_une_moitie_d_emoji_isolee_est_comptee_sous_windows(monkeypatch):
+    """NTFS accepte une moitié d'emoji isolée, laissée par un navigateur qui a
+    tronqué un nom ; `listdir` la rend telle quelle. Le décompte ne doit pas lever."""
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
+    assert module_files._name_length("photo \ud83d.pdf") == len("photo .pdf") + 1
+
+
+def test_un_nom_non_encodable_devient_un_emplacement_inutilisable(monkeypatch):
+    """Une UnicodeError est une ValueError, que `plan()` ne rattrape pas : elle
+    doit devenir une OSError, qui écarte le seul fichier fautif.
+
+    Le décompte est simulé : selon la plateforme, `os.fsencode` lève ou non sur
+    une moitié d'emoji (Windows la laisse passer, Linux la refuse).
+    """
+
+    def decompte(nom: str) -> int:
+        raise UnicodeEncodeError("utf-8", nom, 0, 1, "surrogates not allowed")
+
+    monkeypatch.setattr(module_files, "_name_length", decompte)
+    with pytest.raises(OSError, match="inutilisable"):
+        module_files._check_path_lengths(Path(os.path.abspath(os.sep)) / "photo.pdf")
+
+
+def test_plan_ecarte_seulement_le_fichier_au_nom_illisible(conn, tmp_path, root, monkeypatch):
+    """Un nom que le décompte ne sait pas encoder arrêtait l'analyse de TOUT le
+    dossier, avec un message qui ne nommait pas le fichier."""
+    source = tmp_path / "Entrée"
+    _write(source / "fautif.pdf")
+    _write(source / "sain.pdf")
+    vrai = module_files._name_length
+
+    def decompte(nom: str) -> int:
+        if "fautif" in nom:
+            raise UnicodeEncodeError("utf-16-le", nom, 0, 1, "surrogates not allowed")
+        return vrai(nom)
+
+    monkeypatch.setattr(module_files, "_name_length", decompte)
+    organizer = FileOrganizer(conn, DEFAULT_RULES, root)
+
+    moves = organizer.plan(source)
+
+    assert [move.src.name for move in moves] == ["sain.pdf"]
+    assert [chemin.name for chemin, _ in organizer.last_failures] == ["fautif.pdf"]
+
+
+# --- Chemins relatifs et annulation ------------------------------------------
+
+
+def test_annulation_revient_au_meme_endroit_malgre_un_dossier_relatif(conn, tmp_path, root, monkeypatch):
+    """Un dossier source relatif était journalisé tel quel. Relancée depuis un
+    autre dossier courant, l'annulation renvoyait le fichier ailleurs et
+    soldait le lot : plus aucun moyen de le retrouver par l'application."""
+    base = tmp_path / "base"
+    _write(base / "Entrée" / "facture.pdf")
+    monkeypatch.chdir(base)
+    organizer = FileOrganizer(conn, DEFAULT_RULES, root)
+    plan = organizer.plan("Entrée")
+    assert plan and all(move.src.is_absolute() for move in plan)
+    batch_id = organizer.apply(plan)
+
+    ailleurs = tmp_path / "ailleurs"
+    ailleurs.mkdir()
+    monkeypatch.chdir(ailleurs)  # l'application relancée depuis un autre dossier
+
+    assert organizer.undo(batch_id) == 1
+    assert (base / "Entrée" / "facture.pdf").is_file()
+    assert not (ailleurs / "Entrée").exists()
+
+
+def test_racine_de_rangement_relative_rendue_absolue(conn, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    organizer = FileOrganizer(conn, DEFAULT_RULES, "Rangé")
+    assert organizer.target_root == tmp_path / "Rangé"
+
+
+def test_apply_refuse_un_deplacement_relatif(conn, tmp_path, monkeypatch):
+    """Défense en profondeur : un plan construit à la main avec un chemin relatif
+    ne doit jamais atteindre le journal."""
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path / "a.pdf")
+    organizer = FileOrganizer(conn, DEFAULT_RULES, tmp_path / "R")
+
+    organizer.apply([module_files.PlannedMove(src=Path("a.pdf"), dst=tmp_path / "R" / "a.pdf", rule="x")])
+
+    assert (tmp_path / "a.pdf").is_file()
+    assert "relatif" in organizer.last_failures[0][1]
+    assert conn.execute("SELECT COUNT(*) AS n FROM file_moves").fetchone()["n"] == 0
+
+
+# --- Source injoignable pendant un déplacement --------------------------------
+
+
+@pytest.mark.parametrize(
+    "octets_copies",
+    [
+        1000,  # copie interrompue : la clé est retirée au milieu
+        5000,  # copie complète, mais la suppression de l'original échoue : la clé a disparu
+    ],
+)
+def test_apply_ne_conclut_pas_au_succes_quand_la_source_est_injoignable(
+    conn, tmp_path, root, monkeypatch, octets_copies
+):
+    """Une source qui ne répond plus n'a pas forcément disparu. Conclure au
+    succès gardait une copie tronquée ou un doublon, journalisé comme un
+    déplacement, et l'annulation était ensuite refusée sans fin."""
+    source = tmp_path / "Clé"
+    fichier = _write(source / "vacances.mp4", "V" * 5000)
+    organizer = FileOrganizer(conn, [Rule("Vidéos", "Videos", ["mp4"])], root)
+    plan = organizer.plan(source)
+
+    def copie_puis_cle_retiree(_origine, destination, **_extra):
+        Path(destination).write_text("V" * octets_copies, encoding="utf-8")
+        raise OSError(5, "Input/output error")
+
+    vrai_is_regular = module_files._is_regular
+    vrai_listdir = os.listdir
+
+    def listdir_cle_retiree(chemin="."):
+        if str(chemin) == str(source):
+            raise OSError(2, "Lecteur introuvable")
+        return vrai_listdir(chemin)
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_puis_cle_retiree)
+    # La clé ne répond plus : l'original paraît absent et son dossier est illisible.
+    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == fichier else vrai_is_regular(p))
+    monkeypatch.setattr(module_files.os, "listdir", listdir_cle_retiree)
+
+    organizer.apply(plan)
+
+    assert [chemin.name for chemin, _ in organizer.last_failures] == ["vacances.mp4"]
+    assert not (root / "Videos" / "vacances.mp4").exists()
+    assert conn.execute("SELECT COUNT(*) AS n FROM file_moves").fetchone()["n"] == 0
+    assert fichier.read_text(encoding="utf-8") == "V" * 5000  # l'original est intact
+
+
+# --- Destinations saisies avec des espaces ou un point final -----------------
+
+
+@pytest.mark.parametrize(
+    ("saisie", "attendu"),
+    [
+        ("Documents / Factures", "Documents/Factures"),
+        ("  Admin /  Banque  ", "Admin/Banque"),
+        ("Documents\\ PDF ", "Documents/PDF"),
+    ],
+)
+def test_destination_sans_espaces_autour_des_dossiers(saisie, attendu):
+    """Win32 ne retire les espaces finaux que du dernier segment : « Documents /
+    Factures » faisait échouer chaque fichier de la règle sous Windows."""
+    assert Rule("Test", saisie, ["pdf"]).destination == attendu
+
+
+@pytest.mark.parametrize("saisie", ["Factures./PDF", "Documents/Archives.", "Documents/ /PDF"])
+def test_destination_refuse_un_point_final_ou_un_dossier_sans_nom(saisie):
+    with pytest.raises(ValueError):
+        Rule("Test", saisie, ["pdf"])
 
 
 def test_iter_files_ecarte_les_dossiers_caches_par_attribut(tmp_path, monkeypatch):
