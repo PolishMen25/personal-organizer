@@ -11,6 +11,7 @@ pouvoir tourner hors du fil graphique.
 
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from fnmatch import fnmatchcase
+from functools import cache
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from uuid import uuid4
@@ -126,9 +128,19 @@ def _clean_destination(destination: str, rule_name: str) -> str:
     pure = PureWindowsPath(raw)
     if pure.drive or pure.root:
         raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » doit être un chemin relatif.")
-    parts = [part for part in pure.parts if part != "."]
+    # Win32 ne retire les espaces finales que du DERNIER segment d'un chemin :
+    # « Documents / Factures » créerait « Documents », puis chercherait
+    # « Documents \ Factures » et échouerait pour chaque fichier de la règle.
+    # Les espaces autour d'un « / » sont une saisie naturelle : elles sont
+    # retirées. Seulement U+0020 : Win32 conserve l'espace insécable et les
+    # autres blancs, qui peuvent faire partie d'un vrai nom de dossier. Le point
+    # final, lui, est laissé : Win32 le retire de chaque segment de façon
+    # cohérente, à la création comme au déplacement et à l'annulation.
+    parts = [part.strip(" ") for part in pure.parts if part.strip(" ") != "."]
     if any(part == ".." for part in parts):
         raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » ne peut pas contenir « .. ».")
+    if any(not part for part in parts):
+        raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » contient un dossier sans nom.")
     if not parts:
         raise ValueError(f"Règle « {rule_name} » : la destination ne peut pas être vide.")
     for part in parts:
@@ -428,16 +440,133 @@ def _size(path: Path) -> int:
         return 0
 
 
-def _discard(path: Path) -> None:
-    """Efface un reste de copie inachevée ; l'échec ne doit rien interrompre."""
+def _source_present(source: Path) -> bool | None:
+    """État de l'original après un déplacement interrompu.
+
+    `True` : il est là. `False` : son absence est PROUVÉE, par un dossier source
+    lisible qui ne le contient plus. `None` : on ne sait pas. Une source qui ne
+    répond plus n'a pas forcément disparu (clé USB retirée, partage coupé), et
+    n'est pas forcément intacte non plus : le serveur a pu exécuter la
+    suppression juste avant que la liaison tombe.
+    """
+    if _is_regular(source):
+        return True
+    try:
+        names = os.listdir(source.parent)
+    except OSError:
+        return None
+    return None if source.name in names else False
+
+
+def _mark_uncertain(path: Path, claimed: set[str]) -> Path:
+    """Renomme une copie dont on ignore si elle est complète et si l'original existe encore.
+
+    Sous son nom d'origine, elle passerait pour un rangement réussi ; l'utilisateur
+    pourrait alors supprimer l'original en la croyant fidèle.
+    """
+    try:
+        target = _free_path(path.parent, f"{path.stem} (copie à vérifier){path.suffix}", claimed)
+        os.rename(path, target)
+    except OSError:
+        return path  # renommage impossible : la copie garde son nom, le message la désigne
+    return target
+
+
+def _discard(path: Path, origin: Path | None = None) -> bool:
+    """Efface NOTRE copie, inachevée ou en trop ; `True` si elle a disparu.
+
+    Une copie vers un autre volume reprend l'attribut lecture seule de
+    l'original, et Windows refuse d'effacer un fichier en lecture seule. On
+    ne retire l'attribut, jamais sur l'original, que si la copie est identique
+    octet pour octet à `origin`, présent : l'effacer ne perd alors rien, même
+    si c'était le fichier d'un autre logiciel apparu à la même place. La date
+    de modification ne prouverait rien : FAT32 et exFAT l'arrondissent.
+    """
     try:
         path.unlink(missing_ok=True)
-    except OSError:
+        return True
+    except PermissionError:
         pass
+    except OSError:
+        return False
+    try:
+        if origin is None or not filecmp.cmp(origin, path, shallow=False):
+            return False
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+class UncertainCopy(OSError):
+    """Déplacement interrompu dont l'issue est incertaine : une copie est gardée à `kept`.
+
+    L'original a disparu, ou son état est inconnu : cette copie est peut-être
+    la seule qui reste.
+    """
+
+    def __init__(self, message: str, kept: Path):
+        super().__init__(message)
+        self.kept = kept
+
+
+def _transfer(origin: Path, target: Path, claimed: set[str]) -> Path:
+    """Déplace `origin` vers `target`, place libre, sans jamais effacer ce qui peut être la seule copie.
+
+    Sert au rangement comme à l'annulation. Renvoie `target` si le déplacement
+    a abouti, même malgré une erreur. Lève une OSError si rien n'a bougé
+    (l'original est intact), et `UncertainCopy` si une copie a été gardée faute
+    de savoir si l'original existe encore.
+    """
+    size = _size(origin)
+    try:
+        shutil.move(str(origin), str(target))
+    except OSError as error:
+        present = _source_present(origin)
+        if present:
+            # Vers un autre volume, ou quand le renommage bute sur un verrou,
+            # `shutil.move` copie puis supprime. L'original est intact : ce qui se
+            # trouve à `target` vient de cette copie (la place était libre) et
+            # peut disparaître sans rien perdre.
+            if _discard(target, origin):
+                raise
+            leftover = _mark_uncertain(target, claimed)
+            raise OSError(
+                f"{error}. L'original est intact à « {origin} », mais une copie en trop "
+                f"n'a pas pu être retirée : « {leftover} »."
+            ) from error
+        if present is False and _is_regular(target) and _size(target) == size:
+            return target  # abouti malgré l'erreur
+        if not _is_regular(target):
+            raise OSError(
+                f"{error}. Vérifiez « {origin} » et « {target} » : le fichier a pu être "
+                "déplacé avant l'erreur."
+            ) from error
+        # L'original a disparu, ou on ne sait pas : la copie est peut-être la seule
+        # qui reste. On n'efface rien (au pire un doublon, jamais une perte).
+        kept = _mark_uncertain(target, claimed)
+        raise UncertainCopy(
+            f"{error}. Une copie est conservée à « {kept} » : vérifiez l'original "
+            f"à « {origin} » avant de supprimer l'une ou l'autre.",
+            kept,
+        ) from error
+    return target
+
+
+def _absolute(path: str | Path) -> Path:
+    """Chemin absolu, sans résoudre liens ni jonctions.
+
+    Le journal doit désigner le même endroit quel que soit le dossier courant au
+    moment de l'annulation. Sous Windows, « \\Users\\Jean » et « C:Downloads »
+    ont l'air absolus mais ne le sont pas : ils dépendent du lecteur ou du
+    dossier courant.
+    """
+    return Path(os.path.abspath(path))
 
 
 def _existing_folder(folder: str | Path) -> Path:
-    path = Path(folder)
+    path = _absolute(folder)
     if not path.is_dir():
         raise ValueError(f"Le dossier « {path} » est introuvable.")
     return path
@@ -465,8 +594,8 @@ def _iter_files(folder: Path, recursive: bool) -> Iterator[Path]:
 def _occupied(path: Path) -> bool:
     """Vrai si quelque chose occupe déjà `path`.
 
-    Une erreur autre que « absent » (nom trop long, dossier interdit) signifie
-    que l'emplacement est inutilisable : elle remonte au lieu de laisser croire
+    Une erreur autre que « absent » (dossier interdit) signifie que
+    l'emplacement est inutilisable : elle remonte au lieu de laisser croire
     que la place est libre.
     """
     try:
@@ -475,16 +604,100 @@ def _occupied(path: Path) -> bool:
         raise OSError(f"L'emplacement « {path} » est inutilisable : {error}") from error
 
 
+# Longueur maximale d'un nom de fichier ou de dossier : 255 unités UTF-16 sous
+# Windows (NTFS, exFAT), 255 octets ailleurs (ext4, APFS).
+MAX_NAME_LENGTH = 255
+# Sans prise en charge des chemins longs, réglage par défaut de Windows 10 et 11 :
+# un chemin complet doit rester sous MAX_PATH, un dossier à créer sous 248.
+MAX_PATH = 260
+MAX_DIRECTORY_PATH = 248
+
+
+def _windows() -> bool:
+    return os.name == "nt"
+
+
+def _name_length(name: str) -> int:
+    if _windows():
+        # « surrogatepass » : NTFS accepte une moitié d'emoji isolée, qu'un
+        # navigateur laisse en tronquant un nom ; `listdir` la rend telle quelle.
+        return len(name.encode("utf-16-le", "surrogatepass")) // 2
+    return len(os.fsencode(name))
+
+
+@cache
+def _long_paths_enabled() -> bool:
+    """Vrai si ce processus peut dépasser MAX_PATH.
+
+    Il faut à la fois le réglage système LongPathsEnabled et un exécutable
+    déclaré longPathAware ; `RtlAreLongPathsEnabled` combine les deux. Dans le
+    doute, la limite classique s'applique : mieux vaut un refus au plan qu'un
+    échec au rangement.
+    """
+    if not _windows():
+        return True
+    try:
+        import ctypes
+
+        function = ctypes.WinDLL("ntdll").RtlAreLongPathsEnabled
+        function.argtypes = []
+        function.restype = ctypes.c_ubyte  # BOOLEAN : un seul octet significatif
+        return bool(function())
+    except (AttributeError, OSError):
+        return False
+
+
+def _check_path_lengths(path: Path) -> None:
+    """Refuse un chemin que le système de fichiers ne pourrait pas créer.
+
+    `_occupied` ne peut pas s'en apercevoir partout : sous Windows,
+    `Path.exists()` répond « absent » à un nom ou un chemin trop long au lieu de
+    lever une erreur, et la place paraîtrait libre.
+    """
+    try:
+        for part in path.parts:
+            if _name_length(part) > MAX_NAME_LENGTH:
+                raise OSError(
+                    f"L'emplacement « {path} » est inutilisable : le nom « {part[:40]}… » "
+                    f"dépasse {MAX_NAME_LENGTH} caractères."
+                )
+        if _windows() and not _long_paths_enabled():
+            full = os.path.abspath(path)
+            if _name_length(full) >= MAX_PATH:
+                raise OSError(
+                    f"L'emplacement « {path} » est inutilisable : le chemin complet dépasse "
+                    f"{MAX_PATH - 1} caractères. Raccourcissez le nom du fichier ou la "
+                    "destination de la règle, ou activez les chemins longs de Windows."
+                )
+            directory = os.path.dirname(full)
+            # La limite de 248 vaut pour CRÉER un dossier : dans un dossier qui
+            # existe déjà, seul compte le chemin complet.
+            if _name_length(directory) >= MAX_DIRECTORY_PATH and not os.path.isdir(directory):
+                raise OSError(
+                    f"L'emplacement « {path} » est inutilisable : le dossier de destination "
+                    f"dépasse {MAX_DIRECTORY_PATH - 1} caractères."
+                )
+    except UnicodeError as error:
+        # Une ValueError ne serait pas rattrapée par `plan()` : l'analyse de tout
+        # le dossier s'arrêterait, au lieu d'écarter ce seul fichier.
+        raise OSError(f"L'emplacement « {path} » est inutilisable : nom illisible ({error}).") from error
+
+
 def _free_path(folder: Path, name: str, claimed: set[str]) -> Path:
     """Chemin libre dans `folder` : « nom (2).ext », « nom (3).ext »… si besoin.
 
     `claimed` retient les cibles déjà réservées par le lot en cours, pour que deux
-    fichiers différents ne visent jamais le même chemin final.
+    fichiers différents ne visent jamais le même chemin final. Chaque candidat
+    est contrôlé : le suffixe « (2) » peut faire dépasser la limite à un nom
+    qui la frôlait.
     """
     candidate = folder / name
     stem, suffix = candidate.stem, candidate.suffix
     index = 2
-    while _claim_key(candidate) in claimed or _occupied(candidate):
+    while True:
+        _check_path_lengths(candidate)
+        if _claim_key(candidate) not in claimed and not _occupied(candidate):
+            break
         candidate = folder / f"{stem} ({index}){suffix}"
         index += 1
     claimed.add(_claim_key(candidate))
@@ -551,9 +764,12 @@ class FileOrganizer:
     ):
         self.conn = conn
         self.rules = list(rules)
-        self.target_root = Path(target_root) if target_root is not None else Path.home()
+        self.target_root = _absolute(target_root if target_root is not None else Path.home())
         # Échecs (chemin, message) du dernier `apply()` ou `undo()`, à montrer à l'utilisateur.
         self.last_failures: list[tuple[Path, str]] = []
+        # Copies gardées faute de savoir si l'original existe encore : elles sont
+        # peut-être les seules qui restent, l'interface doit les montrer en premier.
+        self.last_kept_copies: list[Path] = []
 
     def plan(
         self,
@@ -602,14 +818,28 @@ class FileOrganizer:
         progress = progress or _IDLE
         batch_id = uuid4().hex
         self.last_failures = []
+        self.last_kept_copies = []
         claimed: set[str] = set()
         for index, move in enumerate(moves, start=1):
             if progress.cancelled:
                 break  # ce qui est déjà déplacé reste journalisé, donc annulable
             source = Path(move.src)
             progress.step(f"Rangement de « {source.name} »", index, len(moves))
+            if not (source.is_absolute() and Path(move.dst).is_absolute()):
+                # Un chemin relatif journalisé serait résolu à l'annulation contre un
+                # autre dossier courant, et le fichier partirait ailleurs.
+                self.last_failures.append((source, "chemin relatif refusé : il rendrait l'annulation incertaine"))
+                continue
             try:
                 destination = self._move_file(source, Path(move.dst), claimed)
+            except UncertainCopy as error:
+                # Journalisée, la copie reste annulable si l'original a vraiment
+                # disparu ; s'il est revenu, l'annulation refusera de l'écraser, et
+                # le lot se soldera dès que l'utilisateur aura écarté le doublon.
+                self._journal(batch_id, source, error.kept)
+                self.last_failures.append((source, str(error)))
+                self.last_kept_copies.append(error.kept)
+                continue
             except OSError as error:
                 self.last_failures.append((source, str(error)))
                 continue
@@ -623,18 +853,7 @@ class FileOrganizer:
         # La cible a pu apparaître depuis le plan : on renomme plutôt que d'écraser.
         destination = _free_path(destination.parent, destination.name, claimed)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.move(str(source), str(destination))
-        except OSError:
-            if _is_regular(destination) and not _is_regular(source):
-                return destination  # le déplacement a eu lieu malgré l'erreur
-            # Vers un autre volume, `shutil.move` copie puis supprime : une copie
-            # interrompue laisserait à destination un fichier tronqué portant le
-            # nom canonique. `_free_path` a garanti que la place était libre,
-            # donc ce qui s'y trouve vient de cette copie et doit disparaître.
-            _discard(destination)
-            raise
-        return destination
+        return _transfer(source, destination, claimed)
 
     def _journal(self, batch_id: str, source: Path, destination: Path) -> None:
         """Enregistre un déplacement réussi ; un échec d'écriture est signalé, pas levé."""
@@ -662,6 +881,7 @@ class FileOrganizer:
             (batch_id,),
         ).fetchall()
         self.last_failures = []
+        self.last_kept_copies = []
         restored = 0
         for index, row in enumerate(rows, start=1):
             if progress.cancelled:
@@ -670,6 +890,15 @@ class FileOrganizer:
             progress.step(f"Retour de « {source.name} »", index, len(rows))
             try:
                 moved = self._restore_file(source, destination)
+            except UncertainCopy as error:
+                # Une copie est revenue au dossier d'origine, sous un nom qui la
+                # signale, et le message nomme les deux emplacements. La ligne est
+                # soldée : restée ouverte, elle buterait sans fin sur un fichier
+                # rangé disparu, et l'interface, qui annule le lot le plus récent,
+                # ne pourrait plus atteindre les lots plus anciens.
+                self.last_failures.append((destination, str(error)))
+                self.last_kept_copies.append(error.kept)
+                moved = False
             except OSError as error:
                 self.last_failures.append((destination, str(error)))
                 continue
@@ -694,7 +923,10 @@ class FileOrganizer:
         if destination.is_symlink() or not destination.is_file():
             raise OSError(f"« {destination} » est introuvable")
         source.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(destination), str(source))
+        # Même garde-fou qu'au rangement : un retour interrompu (fichier ouvert dans
+        # un autre logiciel, clé retirée) ne doit laisser ni doublon sous le nom
+        # d'origine, ni lot bloqué, ni perte.
+        _transfer(destination, source, set())
         return True
 
     def batches(self, limit: int = 20) -> list[FileBatch]:

@@ -9,6 +9,7 @@ supprimé, et le dernier rangement reste annulable.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from collections.abc import Callable
@@ -114,6 +115,13 @@ _SIZE_UNITS = ("o", "Kio", "Mio", "Gio", "Tio")
 def _plural(number: int) -> str:
     """« s » au-delà de un, pour accorder libellés et participes."""
     return "s" if number > 1 else ""
+
+
+def _kept_heading(count: int) -> str:
+    return (
+        f"{count} copie{_plural(count)} à vérifier : l'original a peut-être disparu, "
+        f"ne supprimez rien avant d'avoir vérifié."
+    )
 
 
 def _default_folder() -> Path:
@@ -871,8 +879,9 @@ class FilesTab(QWidget):
         # interrompu en annonce alors le nombre réel.
         moved = next((batch.count for batch in self._batches if batch.batch_id == batch_id), 0)
         summary = f"{moved} fichier{_plural(moved)} rangé{_plural(moved)}"
-        self._set_info(self._plan_status, f"{summary}.{self._interrupted_note()}")
-        self._report("Rangement terminé", f"{summary}.{self._interrupted_note()}", failures)
+        kept = list(self.ctx.files.last_kept_copies)
+        self._set_status(self._plan_status, f"{summary}.{self._interrupted_note()}", kept)
+        self._report("Rangement terminé", f"{summary}.{self._interrupted_note()}", failures, kept)
         self.dataChanged.emit()
 
     def _interrupted_note(self) -> str:
@@ -897,8 +906,9 @@ class FilesTab(QWidget):
         summary = f"{count} fichier{_plural(count)} remis en place."
         if self._cancelled:
             summary += " Opération interrompue."
-        self._set_info(self._plan_status, summary)
-        self._report("Annulation terminée", summary, failures)
+        kept = list(self.ctx.files.last_kept_copies)
+        self._set_status(self._plan_status, summary, kept)
+        self._report("Annulation terminée", summary, failures, kept)
         self.refresh()
         self.dataChanged.emit()
 
@@ -931,15 +941,39 @@ class FilesTab(QWidget):
         box.exec()
         return box.clickedButton() is confirm
 
-    def _report(self, title: str, message: str, failures: list[tuple[Path, str]]) -> None:
-        """Compte rendu d'une opération, échecs détaillés compris."""
+    def _set_status(self, status: QLabel, summary: str, kept: list[Path]) -> None:
+        """Ligne d'état après une opération ; en erreur s'il reste des copies à vérifier."""
+        if kept:
+            self._set_error(status, f"{summary} {_kept_heading(len(kept))}")
+        else:
+            self._set_info(status, summary)
+
+    def _report(
+        self,
+        title: str,
+        message: str,
+        failures: list[tuple[Path, str]],
+        kept: list[Path] | None = None,
+    ) -> None:
+        """Compte rendu d'une opération, échecs détaillés compris.
+
+        Les copies à vérifier viennent en tête, chemin complet, et ne sont jamais
+        tronquées : l'original a peut-être disparu, elles sont alors les seules
+        qui restent. Mêlées aux échecs ordinaires, un « … et N autres » pourrait
+        les cacher alors que l'utilisateur croit ses fichiers restés en place.
+        """
         box = QMessageBox(self)
         box.setWindowTitle(title)
         if failures:
             box.setIcon(QMessageBox.Icon.Warning)
             box.setText(f"{message} {len(failures)} échec{_plural(len(failures))}.")
-            lines = [f"• {path.name} : {reason}" for path, reason in failures[:MAX_FAILURES_SHOWN]]
-            remaining = len(failures) - len(lines)
+            lines: list[str] = []
+            if kept:
+                lines.append(_kept_heading(len(kept)))
+                lines += [f"• {path}" for path in kept]
+                lines.append("")
+            lines += [f"• {path.name} : {reason}" for path, reason in failures[:MAX_FAILURES_SHOWN]]
+            remaining = len(failures) - min(len(failures), MAX_FAILURES_SHOWN)
             if remaining > 0:
                 lines.append(f"… et {remaining} autre{_plural(remaining)}.")
             box.setInformativeText("\n".join(lines))
@@ -1056,10 +1090,14 @@ class FilesTab(QWidget):
         if not raw:
             self._set_error(status, "Choisissez d'abord un dossier.")
             return None
-        folder = Path(raw).expanduser()
+        # Absolu dès la saisie : « \Users\Jean\Downloads » dépend sinon du lecteur
+        # courant, qui change selon la façon dont l'application est lancée.
+        folder = Path(os.path.abspath(Path(raw).expanduser()))
         if not folder.is_dir():
             self._set_error(status, f"Le dossier « {folder} » est introuvable.")
             return None
+        if str(folder) != raw:
+            self._folder_edit.setText(str(folder))
         self._remember_folder(folder)
         return folder
 

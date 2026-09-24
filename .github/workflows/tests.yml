@@ -10,11 +10,14 @@ permissions:
 
 jobs:
   pytest:
-    name: pytest (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Windows est la plateforme cible : un défaut qui ne s'y montre que là
+        # doit bloquer la PR, pas être découvert à la construction de l'exécutable.
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12"]
 
     steps:
@@ -29,6 +32,7 @@ jobs:
           cache-dependency-path: requirements*.txt
 
       - name: Bibliothèques système requises par Qt
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -47,4 +51,6 @@ jobs:
         env:
           # Aucun serveur graphique sur l'exécuteur : Qt rend hors écran.
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q
+        # Pas de « -q » ici : pyproject.toml en fixe déjà un, et le second
+        # masquerait la ligne de résumé des résultats dans le journal.
+        run: python -m pytest

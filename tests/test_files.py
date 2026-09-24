@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -638,6 +639,724 @@ def test_plan_ecarte_un_seul_fichier_dont_la_destination_est_inutilisable(conn, 
     assert [move.src.name for move in moves] == ["photo.jpg"]
     assert [chemin.name for chemin, _ in organizer.last_failures] == ["facture.pdf"]
     assert "inutilisable" in organizer.last_failures[0][1]
+
+
+@pytest.fixture()
+def stat_facon_windows(monkeypatch):
+    """Reproduit Windows : un nom invalide y est « absent » au lieu de lever une erreur.
+
+    Python y compte ERROR_INVALID_NAME parmi les erreurs à ignorer : `exists()`
+    et `is_symlink()` répondent `False` là où Linux lève ENAMETOOLONG. Sans ce
+    montage, la suite passe sous Linux sur un code qui échoue sous Windows.
+    """
+    for nom in ("exists", "is_symlink"):
+        origine = getattr(Path, nom)
+
+        def silencieux(self, *args, _origine=origine, **kwargs):
+            try:
+                return _origine(self, *args, **kwargs)
+            except OSError:
+                return False
+
+        monkeypatch.setattr(Path, nom, silencieux)
+
+
+@pytest.mark.parametrize("racine_existe", [True, False])
+def test_plan_ecarte_un_nom_trop_long_meme_si_exists_ne_leve_rien(
+    conn, tmp_path, root, stat_facon_windows, racine_existe
+):
+    """Sous Windows, le plan proposait le fichier vers un dossier impossible à
+    créer, faute d'erreur levée par `exists()`."""
+    source = tmp_path / "Entrée"
+    _write(source / "facture.pdf")
+    _write(source / "photo.jpg")
+    if racine_existe:
+        root.mkdir(parents=True)
+    organizer = FileOrganizer(conn, [Rule("Trop long", "A" * 300, ["pdf"]), *DEFAULT_RULES], root)
+
+    moves = organizer.plan(source)
+
+    assert [move.src.name for move in moves] == ["photo.jpg"]
+    assert [chemin.name for chemin, _ in organizer.last_failures] == ["facture.pdf"]
+    assert "inutilisable" in organizer.last_failures[0][1]
+
+
+def test_le_suffixe_de_collision_ne_fait_pas_depasser_la_limite(tmp_path, stat_facon_windows):
+    """« nom (2).pdf » dépasse la limite quand « nom.pdf » l'atteignait tout juste.
+
+    La place est prise via `claimed`, pour ne pas avoir à créer sur le disque un
+    fichier au nom de 255 caractères.
+    """
+    nom = "a" * (module_files.MAX_NAME_LENGTH - len(".pdf")) + ".pdf"
+    dossier = tmp_path / "PDF"
+    claimed = {module_files._claim_key(dossier / nom)}
+
+    with pytest.raises(OSError, match="inutilisable"):
+        module_files._free_path(dossier, nom, claimed)
+
+
+def test_un_nom_a_la_limite_reste_accepte(tmp_path, monkeypatch):
+    # Le chemin complet dépasse 259 caractères : sur un Windows aux réglages
+    # d'usine, c'est la limite de chemin qui répondrait, pas celle du nom.
+    monkeypatch.setattr(module_files, "_long_paths_enabled", lambda: True)
+    nom = "a" * (module_files.MAX_NAME_LENGTH - len(".pdf")) + ".pdf"
+    assert module_files._free_path(tmp_path, nom, set()) == tmp_path / nom
+
+
+@pytest.mark.parametrize(
+    ("nom", "sous_windows", "ailleurs"),
+    [
+        ("a" * 10, 10, 10),
+        ("é" * 200, 200, 400),  # une unité UTF-16, deux octets UTF-8
+        ("😀" * 10, 20, 40),  # hors du plan de base : paire de substitution, quatre octets
+    ],
+)
+def test_longueur_de_nom_selon_le_systeme(monkeypatch, nom, sous_windows, ailleurs):
+    """NTFS compte en unités UTF-16, ext4 en octets : 200 « é » passent sous
+    Windows et pas sous Linux."""
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
+    assert module_files._name_length(nom) == sous_windows
+    monkeypatch.setattr(module_files, "_windows", lambda: False)
+    assert module_files._name_length(nom) == ailleurs
+
+
+# --- Longueur des chemins sous Windows sans chemins longs ---------------------
+
+
+@pytest.fixture()
+def windows_sans_chemins_longs(monkeypatch):
+    """Réglage par défaut de Windows 10 et 11 : LongPathsEnabled vaut 0."""
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
+    monkeypatch.setattr(module_files, "_long_paths_enabled", lambda: False)
+
+
+def _chemin(dossier: int, fichier: int) -> Path:
+    """Chemin absolu dont le dossier fait `dossier` caractères et le nom `fichier`.
+
+    La racine vient d'`abspath` : « / », ou « D:\\ » sous Windows, où un « / »
+    seul recevrait la lettre du lecteur courant et décalerait les bornes.
+    """
+    racine = os.path.abspath(os.sep)
+    return Path(racine + "d" * (dossier - len(racine))) / ("f" * fichier)
+
+
+@pytest.mark.parametrize(
+    ("dossier", "fichier"),
+    [(200, 58), (247, 5)],  # 259 caractères au total ; dossier de 247
+)
+def test_chemin_juste_sous_les_limites_accepte(windows_sans_chemins_longs, dossier, fichier):
+    module_files._check_path_lengths(_chemin(dossier, fichier))
+
+
+@pytest.mark.parametrize(
+    ("dossier", "fichier", "motif"),
+    [
+        (200, 59, "chemin complet"),  # 260 caractères : MAX_PATH atteint
+        (248, 5, "dossier de destination"),  # CreateDirectoryW refuse 248 et plus
+    ],
+)
+def test_chemin_au_dela_des_limites_refuse(windows_sans_chemins_longs, dossier, fichier, motif):
+    with pytest.raises(OSError, match=motif):
+        module_files._check_path_lengths(_chemin(dossier, fichier))
+
+
+def test_dossier_existant_au_dela_de_248_accepte(windows_sans_chemins_longs, monkeypatch):
+    """La limite de 248 vaut pour CRÉER un dossier ; un fichier se crée dans un
+    dossier existant tant que le chemin complet reste sous 260.
+
+    L'existence est simulée : sans chemins longs, Windows refuserait justement
+    de créer ce dossier pour le test.
+    """
+    chemin = _chemin(250, 5)
+    dossier = os.path.dirname(os.path.abspath(chemin))
+    vrai_isdir = os.path.isdir
+    monkeypatch.setattr(module_files.os.path, "isdir", lambda p: os.fspath(p) == dossier or vrai_isdir(p))
+    module_files._check_path_lengths(chemin)
+
+
+def test_chemins_longs_actives_levent_la_limite(monkeypatch):
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
+    monkeypatch.setattr(module_files, "_long_paths_enabled", lambda: True)
+    module_files._check_path_lengths(_chemin(248, 59))
+
+
+def test_plan_ecarte_une_destination_au_dela_de_max_path(conn, tmp_path, root, windows_sans_chemins_longs):
+    """Chaque composant tient sous 255, mais le chemin complet dépasse 259 : sous
+    Windows par défaut, le dossier ne pourra pas être créé. `exists()` y répond
+    « absent » plutôt que de lever, donc seul un contrôle explicite l'aperçoit."""
+    source = tmp_path / "Entrée"
+    long_nom = "r" * 100 + ".pdf"
+    _write(source / long_nom)
+    _write(source / "photo.jpg")
+    organizer = FileOrganizer(conn, [Rule("Profond", "D" * 150, ["pdf"]), *DEFAULT_RULES], root)
+
+    moves = organizer.plan(source)
+
+    assert [move.src.name for move in moves] == ["photo.jpg"]
+    assert [chemin.name for chemin, _ in organizer.last_failures] == [long_nom]
+    assert "chemin complet" in organizer.last_failures[0][1]
+
+
+# --- Noms contenant une moitié d'emoji isolée ----------------------------------
+
+
+def test_une_moitie_d_emoji_isolee_est_comptee_sous_windows(monkeypatch):
+    """NTFS accepte une moitié d'emoji isolée, laissée par un navigateur qui a
+    tronqué un nom ; `listdir` la rend telle quelle. Le décompte ne doit pas lever."""
+    monkeypatch.setattr(module_files, "_windows", lambda: True)
+    assert module_files._name_length("photo \ud83d.pdf") == len("photo .pdf") + 1
+
+
+def test_un_nom_non_encodable_devient_un_emplacement_inutilisable(monkeypatch):
+    """Une UnicodeError est une ValueError, que `plan()` ne rattrape pas : elle
+    doit devenir une OSError, qui écarte le seul fichier fautif.
+
+    Le décompte est simulé : selon la plateforme, `os.fsencode` lève ou non sur
+    une moitié d'emoji (Windows la laisse passer, Linux la refuse).
+    """
+
+    def decompte(nom: str) -> int:
+        raise UnicodeEncodeError("utf-8", nom, 0, 1, "surrogates not allowed")
+
+    monkeypatch.setattr(module_files, "_name_length", decompte)
+    with pytest.raises(OSError, match="inutilisable"):
+        module_files._check_path_lengths(Path(os.path.abspath(os.sep)) / "photo.pdf")
+
+
+def test_plan_ecarte_seulement_le_fichier_au_nom_illisible(conn, tmp_path, root, monkeypatch):
+    """Un nom que le décompte ne sait pas encoder arrêtait l'analyse de TOUT le
+    dossier, avec un message qui ne nommait pas le fichier."""
+    source = tmp_path / "Entrée"
+    _write(source / "fautif.pdf")
+    _write(source / "sain.pdf")
+    vrai = module_files._name_length
+
+    def decompte(nom: str) -> int:
+        if "fautif" in nom:
+            raise UnicodeEncodeError("utf-16-le", nom, 0, 1, "surrogates not allowed")
+        return vrai(nom)
+
+    monkeypatch.setattr(module_files, "_name_length", decompte)
+    organizer = FileOrganizer(conn, DEFAULT_RULES, root)
+
+    moves = organizer.plan(source)
+
+    assert [move.src.name for move in moves] == ["sain.pdf"]
+    assert [chemin.name for chemin, _ in organizer.last_failures] == ["fautif.pdf"]
+
+
+# --- Chemins relatifs et annulation ------------------------------------------
+
+
+def test_annulation_revient_au_meme_endroit_malgre_un_dossier_relatif(conn, tmp_path, root, monkeypatch):
+    """Un dossier source relatif était journalisé tel quel. Relancée depuis un
+    autre dossier courant, l'annulation renvoyait le fichier ailleurs et
+    soldait le lot : plus aucun moyen de le retrouver par l'application."""
+    base = tmp_path / "base"
+    _write(base / "Entrée" / "facture.pdf")
+    monkeypatch.chdir(base)
+    organizer = FileOrganizer(conn, DEFAULT_RULES, root)
+    plan = organizer.plan("Entrée")
+    assert plan and all(move.src.is_absolute() for move in plan)
+    batch_id = organizer.apply(plan)
+
+    ailleurs = tmp_path / "ailleurs"
+    ailleurs.mkdir()
+    monkeypatch.chdir(ailleurs)  # l'application relancée depuis un autre dossier
+
+    assert organizer.undo(batch_id) == 1
+    assert (base / "Entrée" / "facture.pdf").is_file()
+    assert not (ailleurs / "Entrée").exists()
+
+
+def test_racine_de_rangement_relative_rendue_absolue(conn, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    organizer = FileOrganizer(conn, DEFAULT_RULES, "Rangé")
+    assert organizer.target_root == tmp_path / "Rangé"
+
+
+def test_apply_refuse_un_deplacement_relatif(conn, tmp_path, monkeypatch):
+    """Défense en profondeur : un plan construit à la main avec un chemin relatif
+    ne doit jamais atteindre le journal."""
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path / "a.pdf")
+    organizer = FileOrganizer(conn, DEFAULT_RULES, tmp_path / "R")
+
+    organizer.apply([module_files.PlannedMove(src=Path("a.pdf"), dst=tmp_path / "R" / "a.pdf", rule="x")])
+
+    assert (tmp_path / "a.pdf").is_file()
+    assert "relatif" in organizer.last_failures[0][1]
+    assert conn.execute("SELECT COUNT(*) AS n FROM file_moves").fetchone()["n"] == 0
+
+
+# --- Déplacement interrompu : ne jamais effacer ce qui peut être la seule copie
+
+
+def _journal(conn) -> list[tuple[str, str]]:
+    """Lignes encore annulables du journal, (source, destination)."""
+    return [(row["src"], row["dst"]) for row in conn.execute("SELECT src, dst FROM file_moves WHERE undone = 0")]
+
+
+def _liaison_coupee(monkeypatch, dossier: Path, deplacer) -> None:
+    """`shutil.move` remplacé par `deplacer`, et `dossier` illisible : un partage
+    réseau ou une clé USB qui ne répond plus."""
+    vrai_listdir = os.listdir
+
+    def listdir(chemin="."):
+        if str(chemin) == str(dossier):
+            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+        return vrai_listdir(chemin)
+
+    monkeypatch.setattr(module_files.shutil, "move", deplacer)
+    monkeypatch.setattr(module_files.os, "listdir", listdir)
+
+
+def _cle_retiree_pendant_la_copie(monkeypatch, source: Path, fichier: Path, octets: int) -> None:
+    """La copie écrit `octets` octets, puis la clé disparaît : l'original ne répond plus."""
+
+    def copie_puis_cle_retiree(_origine, destination, **_extra):
+        Path(destination).write_text("V" * octets, encoding="utf-8")
+        raise OSError(5, "Input/output error")
+
+    vrai_is_regular = module_files._is_regular
+    _liaison_coupee(monkeypatch, source, copie_puis_cle_retiree)
+    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == fichier else vrai_is_regular(p))
+
+
+@pytest.mark.parametrize(
+    "octets_copies",
+    [
+        1000,  # copie interrompue : la clé est retirée au milieu
+        5000,  # copie complète, mais la suppression de l'original échoue : la clé a disparu
+    ],
+)
+def test_source_injoignable_copie_gardee_et_journalisee(conn, tmp_path, root, monkeypatch, octets_copies):
+    """Une source qui ne répond plus n'a pas forcément disparu, ni survécu. La
+    copie est gardée (l'effacer perdrait peut-être la seule), renommée pour ne
+    pas passer pour un rangement réussi, et journalisée pour rester annulable."""
+    source = tmp_path / "Clé"
+    fichier = _write(source / "vacances.mp4", "V" * 5000)
+    organizer = FileOrganizer(conn, [Rule("Vidéos", "Videos", ["mp4"])], root)
+    plan = organizer.plan(source)
+    _cle_retiree_pendant_la_copie(monkeypatch, source, fichier, octets_copies)
+
+    organizer.apply(plan)
+
+    gardee = root / "Videos" / "vacances (copie à vérifier).mp4"
+    assert [chemin.name for chemin, _ in organizer.last_failures] == ["vacances.mp4"]
+    assert "copie est conservée" in organizer.last_failures[0][1]
+    assert organizer.last_kept_copies == [gardee]
+    assert not (root / "Videos" / "vacances.mp4").exists()
+    assert gardee.read_text(encoding="utf-8") == "V" * octets_copies
+    assert _journal(conn) == [(str(fichier), str(gardee))]
+    assert fichier.read_text(encoding="utf-8") == "V" * 5000
+
+
+def test_coupure_reseau_apres_suppression_de_l_original_copie_gardee_et_annulable(conn, tmp_path, root, monkeypatch):
+    """Constat bloquant, relevé deux fois : le partage exécute la suppression de
+    l'original, puis la liaison tombe avant la réponse. Effacer la copie perdait
+    le fichier ; ne pas la journaliser le rendait inannulable, alors qu'il
+    l'était sur main. Gardée et journalisée, elle revient à la place de
+    l'original dès que la liaison est rétablie."""
+    source = tmp_path / "NAS"
+    fichier = _write(source / "contrat.pdf", "C" * 4000)
+    organizer = FileOrganizer(conn, [Rule("Contrats", "Contrats", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def deplace_puis_liaison_coupee(origine, destination, **extra):
+        _VRAI_MOVE(origine, destination, **extra)  # copie ET suppression de l'original
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    _liaison_coupee(monkeypatch, source, deplace_puis_liaison_coupee)
+    batch_id = organizer.apply(plan)
+
+    gardee = root / "Contrats" / "contrat (copie à vérifier).pdf"
+    assert not fichier.exists()  # l'original a bien disparu du partage
+    assert gardee.read_text(encoding="utf-8") == "C" * 4000  # la seule copie survit
+    assert "copie est conservée" in organizer.last_failures[0][1]
+
+    monkeypatch.undo()  # la liaison est rétablie
+    assert [lot.count for lot in organizer.batches()] == [1]
+    assert organizer.undo(batch_id) == 1
+    assert fichier.read_text(encoding="utf-8") == "C" * 4000
+    assert not gardee.exists()
+    assert organizer.batches() == []
+
+
+def test_original_revenu_l_annulation_n_ecrase_rien_puis_se_solde(conn, tmp_path, root, monkeypatch):
+    """La clé est rebranchée : l'original est là, intact, et la copie gardée à
+    côté. L'annulation refuse d'écraser ; une fois le doublon écarté par
+    l'utilisateur, elle solde le lot au lieu de le proposer sans fin."""
+    source = tmp_path / "Clé"
+    fichier = _write(source / "vacances.mp4", "V" * 5000)
+    organizer = FileOrganizer(conn, [Rule("Vidéos", "Videos", ["mp4"])], root)
+    plan = organizer.plan(source)
+    _cle_retiree_pendant_la_copie(monkeypatch, source, fichier, 1000)
+    batch_id = organizer.apply(plan)
+    monkeypatch.undo()  # la clé est rebranchée
+
+    gardee = root / "Videos" / "vacances (copie à vérifier).mp4"
+    assert organizer.undo(batch_id) == 0
+    assert "occupé par un autre fichier" in organizer.last_failures[0][1]
+    assert fichier.read_text(encoding="utf-8") == "V" * 5000  # rien n'est écrasé
+    assert gardee.read_text(encoding="utf-8") == "V" * 1000
+
+    gardee.unlink()  # l'utilisateur a vérifié l'original et écarte le doublon
+    assert organizer.undo(batch_id) == 0
+    assert organizer.last_failures == []
+    assert organizer.batches() == []
+
+
+def test_original_disparu_et_copie_incomplete_la_copie_est_gardee(conn, tmp_path, root, monkeypatch):
+    """L'original a disparu (dossier lisible, fichier absent), mais la copie n'a
+    pas la taille relevée : ce n'est pas un succès, et c'est pourtant la seule
+    trace qui reste. On la garde, et on la journalise."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "rapport.pdf", "R" * 3000)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def copie_partielle_puis_original_supprime(origine, destination, **_extra):
+        Path(destination).write_text("R" * 1000, encoding="utf-8")
+        Path(origine).unlink()
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_partielle_puis_original_supprime)
+
+    organizer.apply(plan)
+
+    gardee = root / "PDF" / "rapport (copie à vérifier).pdf"
+    assert not fichier.exists()
+    assert gardee.read_text(encoding="utf-8") == "R" * 1000
+    assert "copie est conservée" in organizer.last_failures[0][1]
+    assert _journal(conn) == [(str(fichier), str(gardee))]
+
+
+def test_copie_gardee_sous_son_nom_si_le_renommage_echoue(conn, tmp_path, root, monkeypatch):
+    """Le renommage n'est qu'un signal : s'il échoue, la copie reste sous son nom
+    et le message la désigne, mais rien n'est effacé."""
+    source = tmp_path / "NAS"
+    fichier = _write(source / "contrat.pdf", "C" * 4000)
+    organizer = FileOrganizer(conn, [Rule("Contrats", "Contrats", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def deplace_puis_liaison_coupee(origine, destination, **extra):
+        _VRAI_MOVE(origine, destination, **extra)
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    def renommage_refuse(*_args, **_kwargs):
+        raise PermissionError(13, "Accès refusé")
+
+    _liaison_coupee(monkeypatch, source, deplace_puis_liaison_coupee)
+    monkeypatch.setattr(module_files.os, "rename", renommage_refuse)
+
+    organizer.apply(plan)
+
+    gardee = root / "Contrats" / "contrat.pdf"
+    assert gardee.read_text(encoding="utf-8") == "C" * 4000
+    assert str(gardee) in organizer.last_failures[0][1]
+    assert _journal(conn) == [(str(fichier), str(gardee))]
+
+
+def _unlink_facon_windows(monkeypatch) -> None:
+    """Windows refuse d'effacer un fichier en lecture seule ; Linux l'accepte."""
+    vrai_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        try:
+            mode = self.stat().st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not mode & stat.S_IWRITE:
+            raise PermissionError(13, "Accès refusé", str(self))
+        return vrai_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+
+def test_copie_en_lecture_seule_retiree_quand_l_original_reste(conn, tmp_path, root, monkeypatch):
+    """Constat : vers un autre volume, la copie reprend l'attribut lecture seule
+    de l'original, que Windows refuse d'effacer. L'échec était avalé : la copie
+    restait sous le nom canonique, et chaque essai en ajoutait une autre."""
+    source = tmp_path / "Clé"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    os.chmod(fichier, stat.S_IREAD)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def copie_puis_original_indelebile(origine, destination, **_extra):
+        shutil.copy2(origine, destination)  # recopie l'attribut lecture seule
+        raise PermissionError(13, "Accès refusé", str(origine))
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_puis_original_indelebile)
+    _unlink_facon_windows(monkeypatch)
+    try:
+        for _essai in range(3):
+            organizer.apply(plan)
+            assert len(organizer.last_failures) == 1
+    finally:
+        os.chmod(fichier, stat.S_IREAD | stat.S_IWRITE)
+
+    assert list((root / "PDF").iterdir()) == []  # ni copie, ni doublons accumulés
+    assert _journal(conn) == []
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
+@pytest.mark.parametrize(
+    "arrondi_ns",
+    [
+        2 * 10**9,  # FAT32 : la date de modification est arrondie à 2 secondes
+        10**7,  # exFAT : à 10 millisecondes
+    ],
+)
+def test_copie_en_lecture_seule_retiree_meme_si_la_cle_arrondit_la_date(conn, tmp_path, root, monkeypatch, arrondi_ns):
+    """Constat : reconnaître notre copie à sa date de modification échouait sur
+    une clé USB en FAT32 ou exFAT, qui l'arrondissent. La copie en lecture
+    seule n'était plus effacée, et chaque essai ajoutait un doublon. C'est le
+    contenu, identique à l'original présent, qui prouve qu'elle n'apporte rien."""
+    source = tmp_path / "Disque"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    os.utime(fichier, ns=(1_700_000_000_123_456_789, 1_700_000_000_123_456_789))
+    os.chmod(fichier, stat.S_IREAD)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def copie_vers_cle_puis_original_indelebile(origine, destination, **_extra):
+        shutil.copyfile(origine, destination)
+        date = os.stat(origine).st_mtime_ns // arrondi_ns * arrondi_ns
+        os.utime(destination, ns=(date, date))
+        os.chmod(destination, stat.S_IREAD)
+        raise PermissionError(13, "Accès refusé", str(origine))
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_vers_cle_puis_original_indelebile)
+    _unlink_facon_windows(monkeypatch)
+    try:
+        for _essai in range(3):
+            organizer.apply(plan)
+            assert len(organizer.last_failures) == 1
+    finally:
+        os.chmod(fichier, stat.S_IREAD | stat.S_IWRITE)
+
+    assert list((root / "PDF").iterdir()) == []  # ni copie, ni doublons accumulés sur la clé
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
+def test_copie_en_trop_indelebile_renommee_quand_l_original_reste(conn, tmp_path, root, monkeypatch):
+    """Si notre copie résiste vraiment à l'effacement (partage coupé), elle ne
+    doit pas rester sous le nom canonique, où elle passerait pour un rangement
+    réussi : elle est renommée et le message la désigne."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+    cible = root / "PDF" / "facture.pdf"
+
+    def copie_puis_echec(origine, destination, **_extra):
+        shutil.copy2(origine, destination)
+        raise OSError(5, "Input/output error")
+
+    vrai_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self == cible:
+            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+        return vrai_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_puis_echec)
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    organizer.apply(plan)
+
+    en_trop = root / "PDF" / "facture (copie à vérifier).pdf"
+    assert not cible.exists()
+    assert en_trop.is_file()
+    assert "copie en trop" in organizer.last_failures[0][1]
+    assert str(en_trop) in organizer.last_failures[0][1]
+    assert _journal(conn) == []
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
+def test_annulation_d_un_fichier_ouvert_ne_laisse_ni_doublon_ni_lot_bloque(conn, tmp_path, root, monkeypatch):
+    """Constat : un fichier rangé puis ouvert dans Word. Le renommage bute sur le
+    verrou, `shutil.move` se replie sur une copie, puis ne peut pas effacer le
+    fichier ouvert. Une copie restait sous le nom d'origine, et chaque
+    annulation suivante était refusée : « occupé par un autre fichier »."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "rapport.docx", "W" * 3000)
+    organizer = FileOrganizer(conn, [Rule("Docs", "Docs", ["docx"])], root)
+    batch_id = organizer.apply(organizer.plan(source))
+    range_ = root / "Docs" / "rapport.docx"
+    assert range_.is_file()
+
+    def copie_puis_verrou(origine, destination, **_extra):
+        shutil.copy2(origine, destination)  # Word autorise la lecture
+        raise PermissionError(32, "Le processus ne peut pas accéder au fichier", str(origine))
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_puis_verrou)
+    assert organizer.undo(batch_id) == 0
+    assert not fichier.exists()  # aucun doublon sous le nom d'origine
+    assert range_.read_text(encoding="utf-8") == "W" * 3000
+    assert [lot.count for lot in organizer.batches()] == [1]
+
+    monkeypatch.undo()  # Word est fermé
+    assert organizer.undo(batch_id) == 1
+    assert fichier.read_text(encoding="utf-8") == "W" * 3000
+    assert not range_.exists()
+
+
+def test_annulation_incertaine_solde_son_lot_et_libere_les_plus_anciens(conn, tmp_path, root, monkeypatch):
+    """Constat (régression) : pendant une annulation, le serveur supprime le
+    fichier rangé puis la liaison tombe. La copie revenue était renommée et la
+    ligne restait ouverte : chaque annulation suivante butait sur « introuvable »,
+    et l'interface, qui annule le lot le plus récent, n'atteignait plus les
+    lots plus anciens. Sur main, la ligne se soldait."""
+    source = tmp_path / "Entrée"
+    ancien = _write(source / "ancien.pdf", "A" * 1000)
+    regles = [Rule("Docs", "Docs", ["pdf", "docx"])]
+    lot_ancien = FileOrganizer(conn, regles, root)
+    lot_ancien_id = lot_ancien.apply(lot_ancien.plan(source))
+    _write(source / "rapport.docx", "W" * 3000)
+    organizer = FileOrganizer(conn, regles, root)
+    batch_id = organizer.apply(organizer.plan(source))
+    range_ = root / "Docs" / "rapport.docx"
+
+    def retour_puis_liaison_coupee(origine, destination, **extra):
+        _VRAI_MOVE(origine, destination, **extra)  # copie ET suppression du fichier rangé
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    _liaison_coupee(monkeypatch, root / "Docs", retour_puis_liaison_coupee)
+    assert organizer.undo(batch_id) == 0
+    monkeypatch.undo()  # la liaison est rétablie
+
+    revenue = source / "rapport (copie à vérifier).docx"
+    assert not range_.exists()
+    assert revenue.read_text(encoding="utf-8") == "W" * 3000  # rien n'est perdu
+    assert organizer.last_kept_copies == [revenue]
+    assert [lot.batch_id for lot in organizer.batches()] == [lot_ancien_id]  # le lot ancien redevient accessible
+    assert organizer.undo(lot_ancien_id) == 1
+    assert ancien.read_text(encoding="utf-8") == "A" * 1000
+
+
+def test_annulation_incertaine_ne_perd_pas_le_fichier_range_encore_present(conn, tmp_path, root, monkeypatch):
+    """Solder la ligne ne doit rien perdre quand le fichier rangé existait encore,
+    simplement injoignable : il reste en place, à côté de la copie revenue."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "rapport.docx", "W" * 3000)
+    organizer = FileOrganizer(conn, [Rule("Docs", "Docs", ["docx"])], root)
+    batch_id = organizer.apply(organizer.plan(source))
+    range_ = root / "Docs" / "rapport.docx"
+
+    def copie_puis_liaison_coupee(origine, destination, **_extra):
+        shutil.copy2(origine, destination)  # le fichier rangé n'est PAS supprimé
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    vrai_is_regular = module_files._is_regular
+    _liaison_coupee(monkeypatch, root / "Docs", copie_puis_liaison_coupee)
+    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == range_ else vrai_is_regular(p))
+    organizer.undo(batch_id)
+    monkeypatch.undo()
+
+    assert range_.read_text(encoding="utf-8") == "W" * 3000
+    assert (source / "rapport (copie à vérifier).docx").read_text(encoding="utf-8") == "W" * 3000
+    assert not fichier.exists()  # aucun des deux ne se fait passer pour l'original revenu
+    assert any(str(range_) in message for _, message in organizer.last_failures)
+
+
+def test_le_fichier_d_un_autre_logiciel_apparu_a_la_cible_n_est_jamais_efface(conn, tmp_path, root, monkeypatch):
+    """Course de quelques microsecondes : un autre logiciel dépose un fichier en
+    lecture seule à la cible. Le retrait de la lecture seule, prévu pour NOTRE
+    copie, l'aurait effacé. Seul un contenu identique à l'original, présent,
+    autorise l'effacement : même avec la date de l'original, un contenu
+    différent reste protégé."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def intrus_puis_echec(origine, destination, **_extra):
+        intrus = Path(destination)
+        intrus.write_text("CONTENU D'UN AUTRE LOGICIEL", encoding="utf-8")
+        date = os.stat(origine)
+        os.utime(intrus, ns=(date.st_atime_ns, date.st_mtime_ns))  # même date que l'original
+        os.chmod(intrus, stat.S_IREAD)
+        raise PermissionError(13, "Accès refusé", str(destination))
+
+    monkeypatch.setattr(module_files.shutil, "move", intrus_puis_echec)
+    _unlink_facon_windows(monkeypatch)
+
+    organizer.apply(plan)
+
+    restants = list((root / "PDF").iterdir())
+    try:
+        assert [p.read_text(encoding="utf-8") for p in restants] == ["CONTENU D'UN AUTRE LOGICIEL"]
+    finally:
+        for chemin in restants:
+            os.chmod(chemin, stat.S_IREAD | stat.S_IWRITE)
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
+def test_destination_illisible_le_message_nomme_les_deux_emplacements(conn, tmp_path, root, monkeypatch):
+    """Renommage exécuté par le serveur, puis liaison coupée : ni la source ni la
+    destination ne répondent. Le message ne citait que la source, alors que le
+    fichier était peut-être déjà rangé."""
+    source = tmp_path / "Partage"
+    fichier = _write(source / "bilan.xlsx", "B" * 1000)
+    organizer = FileOrganizer(conn, [Rule("Tableurs", "Tableurs", ["xlsx"])], root)
+    plan = organizer.plan(source)
+    cible = root / "Tableurs" / "bilan.xlsx"
+
+    def deplace_puis_liaison_coupee(origine, destination, **extra):
+        _VRAI_MOVE(origine, destination, **extra)
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    vrai_is_regular = module_files._is_regular
+    _liaison_coupee(monkeypatch, source, deplace_puis_liaison_coupee)
+    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == cible else vrai_is_regular(p))
+
+    organizer.apply(plan)
+
+    message = organizer.last_failures[0][1]
+    assert str(fichier) in message
+    assert str(cible) in message
+
+
+# --- Destinations saisies avec des espaces ou un point final -----------------
+
+
+@pytest.mark.parametrize(
+    ("saisie", "attendu"),
+    [
+        ("Documents / Factures", "Documents/Factures"),
+        ("  Admin /  Banque  ", "Admin/Banque"),
+        ("Documents\\ PDF ", "Documents/PDF"),
+        # Espace insécable : Win32 la conserve, elle peut faire partie du nom.
+        ("Documents/ Factures", "Documents/ Factures"),
+        # Point final : Win32 le retire de chaque segment, de façon cohérente.
+        ("Clients/ACME Inc./Contrats", "Clients/ACME Inc./Contrats"),
+    ],
+)
+def test_destination_nettoyee_des_espaces_autour_des_dossiers(saisie, attendu):
+    """Win32 ne retire les espaces finales que du dernier segment : « Documents /
+    Factures » faisait échouer chaque fichier de la règle sous Windows."""
+    assert Rule("Test", saisie, ["pdf"]).destination == attendu
+
+
+def test_destination_refuse_un_dossier_sans_nom():
+    with pytest.raises(ValueError, match="sans nom"):
+        Rule("Test", "Documents/ /PDF", ["pdf"])
+
+
+def test_regle_a_point_final_gardee_au_chargement(tmp_path):
+    """Constat : refuser le point final écartait au chargement des règles qui
+    fonctionnaient, et l'éditeur de règles les effaçait ensuite du fichier."""
+    chemin = tmp_path / "regles.json"
+    regle = {"name": "ACME", "destination": "Clients/ACME Inc.", "extensions": [], "patterns": ["*acme*"]}
+    chemin.write_text(json.dumps([regle]), encoding="utf-8")
+
+    rapport = read_rules(chemin)
+
+    assert rapport.errors == []
+    assert [r.destination for r in rapport.rules] == ["Clients/ACME Inc."]
 
 
 def test_iter_files_ecarte_les_dossiers_caches_par_attribut(tmp_path, monkeypatch):

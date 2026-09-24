@@ -28,7 +28,8 @@ from organizer import files as module_files
 from organizer.context import AppContext
 from organizer.tasks import PRIORITY_HIGH
 from organizer.timer import Phase
-from organizer.ui.files_tab import FOLDER_PLACEHOLDER, FilesTab
+from organizer.ui.files_tab import FOLDER_PLACEHOLDER, LAST_FOLDER_KEY, FilesTab
+from organizer.ui import files_tab as module_files_tab
 from organizer.ui import focus_tab as module_focus
 from organizer.ui.focus_tab import FocusTab
 from organizer.ui.main_window import MainWindow
@@ -436,6 +437,60 @@ def test_dossier_introuvable_affiche_une_erreur(
     assert "introuvable" in files._plan_status.text()
     assert files._plan == []
     assert ctx.files.batches() == []
+
+
+def test_dossier_relatif_rendu_absolu_et_memorise(
+    window: MainWindow, ctx: AppContext, tmp_path: Path, pump, monkeypatch
+) -> None:
+    """Un dossier relatif dépend du dossier courant, qui change selon la façon
+    dont l'application est lancée : il est rendu absolu dès la saisie, et c'est
+    la forme absolue qui est affichée et mémorisée."""
+    dossier = _dossier_de_test(tmp_path)
+    monkeypatch.chdir(dossier.parent)
+    files = _onglet(window, FilesTab)
+    champ = _champ(files, FOLDER_PLACEHOLDER)
+    champ.setText(dossier.name)
+    _cliquer(_bouton(files, "Analyser"))
+    _attendre_fichiers(files, pump)
+    pump()
+
+    assert champ.text() == str(dossier)
+    assert ctx.settings.get(LAST_FOLDER_KEY) == str(dossier)
+    assert files._plan and all(move.src.is_absolute() for move in files._plan)
+
+
+def test_copies_a_verifier_en_tete_du_compte_rendu_jamais_tronquees(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mêlées aux échecs ordinaires, les copies à vérifier pouvaient disparaître
+    derrière « … et N autres » : l'utilisateur croyait tous ses fichiers restés
+    en place, alors qu'un original avait peut-être quitté le partage."""
+    files = _onglet(window, FilesTab)
+    boites: list = []
+    monkeypatch.setattr(module_files_tab.QMessageBox, "exec", lambda box: boites.append(box) or 0)
+    echecs = [(Path(f"verrou-{index}.pdf"), "fichier utilisé") for index in range(12)]
+    gardee = Path("Rangé") / "Contrats" / "contrat (copie à vérifier).pdf"
+    echecs.append((Path("contrat.pdf"), "Une copie est conservée…"))
+
+    files._report("Rangement terminé", "2 fichiers rangés.", echecs, [gardee])
+
+    texte = boites[0].informativeText()
+    assert texte.startswith("1 copie à vérifier")
+    assert f"• {gardee}" in texte
+    assert "… et 5 autres." in texte  # la troncature ne touche que les échecs ordinaires
+
+
+def test_ligne_d_etat_en_erreur_quand_une_copie_est_a_verifier(window: MainWindow) -> None:
+    """Après fermeture du compte rendu, la ligne d'état reste la seule trace :
+    elle ne doit pas annoncer en couleur neutre un rangement réussi."""
+    files = _onglet(window, FilesTab)
+    files._set_status(files._plan_status, "2 fichiers rangés.", [Path("copie (copie à vérifier).pdf")])
+    assert "1 copie à vérifier" in files._plan_status.text()
+    assert COLORS["danger"] in files._plan_status.styleSheet()
+
+    files._set_status(files._plan_status, "2 fichiers rangés.", [])
+    assert files._plan_status.text() == "2 fichiers rangés."
+    assert COLORS["danger"] not in files._plan_status.styleSheet()
 
 
 # -- Navigation et fermeture ---------------------------------------------
