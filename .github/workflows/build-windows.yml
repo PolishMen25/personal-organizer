@@ -1,0 +1,58 @@
+name: Build Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Par défaut, lecture seule ; le job élargit uniquement ce qu'il lui faut.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Exécutable Windows
+    runs-on: windows-latest
+    permissions:
+      # Nécessaire pour créer la release et y joindre le binaire.
+      contents: write
+
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Dépendances Python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Suite de tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Construction de l'exécutable
+        run: python -m PyInstaller --noconfirm --clean --distpath dist --workpath build packaging/organizer.spec
+
+      - name: Dépôt de l'artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalOrganizer-exe
+          path: dist/PersonalOrganizer.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publication de la release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$env:TAG" "dist/PersonalOrganizer.exe" --title "Personal Organizer $env:TAG" --generate-notes
