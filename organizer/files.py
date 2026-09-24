@@ -471,12 +471,81 @@ def _mark_uncertain(path: Path, claimed: set[str]) -> Path:
     return target
 
 
-def _discard(path: Path) -> None:
-    """Efface un reste de copie inachevée ; l'échec ne doit rien interrompre."""
+def _discard(path: Path) -> bool:
+    """Efface NOTRE copie, inachevée ou en trop ; `True` si elle a disparu.
+
+    Une copie vers un autre volume reprend l'attribut lecture seule de
+    l'original, et Windows refuse d'effacer un fichier en lecture seule : on
+    le retire d'abord, sur notre copie seulement, jamais sur l'original.
+    """
     try:
         path.unlink(missing_ok=True)
-    except OSError:
+        return True
+    except PermissionError:
         pass
+    except OSError:
+        return False
+    try:
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+class UncertainCopy(OSError):
+    """Déplacement interrompu dont l'issue est incertaine : une copie est gardée à `kept`.
+
+    L'original a disparu, ou son état est inconnu : cette copie est peut-être
+    la seule qui reste.
+    """
+
+    def __init__(self, message: str, kept: Path):
+        super().__init__(message)
+        self.kept = kept
+
+
+def _transfer(origin: Path, target: Path, claimed: set[str]) -> Path:
+    """Déplace `origin` vers `target`, place libre, sans jamais effacer ce qui peut être la seule copie.
+
+    Sert au rangement comme à l'annulation. Renvoie `target` si le déplacement
+    a abouti, même malgré une erreur. Lève une OSError si rien n'a bougé
+    (l'original est intact), et `UncertainCopy` si une copie a été gardée faute
+    de savoir si l'original existe encore.
+    """
+    size = _size(origin)
+    try:
+        shutil.move(str(origin), str(target))
+    except OSError as error:
+        present = _source_present(origin)
+        if present:
+            # Vers un autre volume, ou quand le renommage bute sur un verrou,
+            # `shutil.move` copie puis supprime. L'original est intact : ce qui se
+            # trouve à `target` vient de cette copie (la place était libre) et
+            # peut disparaître sans rien perdre.
+            if _discard(target):
+                raise
+            leftover = _mark_uncertain(target, claimed)
+            raise OSError(
+                f"{error}. L'original est intact à « {origin} », mais une copie en trop "
+                f"n'a pas pu être retirée : « {leftover} »."
+            ) from error
+        if present is False and _is_regular(target) and _size(target) == size:
+            return target  # abouti malgré l'erreur
+        if not _is_regular(target):
+            raise OSError(
+                f"{error}. Vérifiez « {origin} » et « {target} » : le fichier a pu être "
+                "déplacé avant l'erreur."
+            ) from error
+        # L'original a disparu, ou on ne sait pas : la copie est peut-être la seule
+        # qui reste. On n'efface rien (au pire un doublon, jamais une perte).
+        kept = _mark_uncertain(target, claimed)
+        raise UncertainCopy(
+            f"{error}. Une copie est conservée à « {kept} » : vérifiez l'original "
+            f"à « {origin} » avant de supprimer l'une ou l'autre.",
+            kept,
+        ) from error
+    return target
 
 
 def _absolute(path: str | Path) -> Path:
@@ -692,6 +761,9 @@ class FileOrganizer:
         self.target_root = _absolute(target_root if target_root is not None else Path.home())
         # Échecs (chemin, message) du dernier `apply()` ou `undo()`, à montrer à l'utilisateur.
         self.last_failures: list[tuple[Path, str]] = []
+        # Copies gardées faute de savoir si l'original existe encore : elles sont
+        # peut-être les seules qui restent, l'interface doit les montrer en premier.
+        self.last_kept_copies: list[Path] = []
 
     def plan(
         self,
@@ -740,6 +812,7 @@ class FileOrganizer:
         progress = progress or _IDLE
         batch_id = uuid4().hex
         self.last_failures = []
+        self.last_kept_copies = []
         claimed: set[str] = set()
         for index, move in enumerate(moves, start=1):
             if progress.cancelled:
@@ -753,6 +826,14 @@ class FileOrganizer:
                 continue
             try:
                 destination = self._move_file(source, Path(move.dst), claimed)
+            except UncertainCopy as error:
+                # Journalisée, la copie reste annulable si l'original a vraiment
+                # disparu ; s'il est revenu, l'annulation refusera de l'écraser, et
+                # le lot se soldera dès que l'utilisateur aura écarté le doublon.
+                self._journal(batch_id, source, error.kept)
+                self.last_failures.append((source, str(error)))
+                self.last_kept_copies.append(error.kept)
+                continue
             except OSError as error:
                 self.last_failures.append((source, str(error)))
                 continue
@@ -766,32 +847,7 @@ class FileOrganizer:
         # La cible a pu apparaître depuis le plan : on renomme plutôt que d'écraser.
         destination = _free_path(destination.parent, destination.name, claimed)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        size = _size(source)
-        try:
-            shutil.move(str(source), str(destination))
-        except OSError as error:
-            present = _source_present(source)
-            if present:
-                # Vers un autre volume, `shutil.move` copie puis supprime. L'original
-                # est intact : ce qui se trouve à destination vient de cette copie
-                # (`_free_path` a garanti que la place était libre) et peut disparaître
-                # sans rien perdre, plutôt que de rester tronqué sous le nom canonique.
-                _discard(destination)
-                raise
-            if present is False and _is_regular(destination) and _size(destination) == size:
-                return destination  # déplacement abouti malgré l'erreur : il sera journalisé
-            if not _is_regular(destination):
-                raise
-            # L'original a disparu, ou on ne sait pas : la destination est peut-être la
-            # seule copie qui reste. On n'efface rien (au pire un doublon, jamais une
-            # perte) et on ne journalise pas, sinon l'annulation buterait sans fin sur
-            # un original revenu.
-            kept = _mark_uncertain(destination, claimed)
-            raise OSError(
-                f"{error}. Une copie est conservée à « {kept} » : vérifiez l'original "
-                f"à « {source} » avant de supprimer l'une ou l'autre."
-            ) from error
-        return destination
+        return _transfer(source, destination, claimed)
 
     def _journal(self, batch_id: str, source: Path, destination: Path) -> None:
         """Enregistre un déplacement réussi ; un échec d'écriture est signalé, pas levé."""
@@ -819,6 +875,7 @@ class FileOrganizer:
             (batch_id,),
         ).fetchall()
         self.last_failures = []
+        self.last_kept_copies = []
         restored = 0
         for index, row in enumerate(rows, start=1):
             if progress.cancelled:
@@ -827,6 +884,11 @@ class FileOrganizer:
             progress.step(f"Retour de « {source.name} »", index, len(rows))
             try:
                 moved = self._restore_file(source, destination)
+            except UncertainCopy as error:
+                # La ligne reste ouverte : le fichier rangé existe peut-être encore.
+                self.last_failures.append((destination, str(error)))
+                self.last_kept_copies.append(error.kept)
+                continue
             except OSError as error:
                 self.last_failures.append((destination, str(error)))
                 continue
@@ -851,7 +913,10 @@ class FileOrganizer:
         if destination.is_symlink() or not destination.is_file():
             raise OSError(f"« {destination} » est introuvable")
         source.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(destination), str(source))
+        # Même garde-fou qu'au rangement : un retour interrompu (fichier ouvert dans
+        # un autre logiciel, clé retirée) ne doit laisser ni doublon sous le nom
+        # d'origine, ni lot bloqué, ni perte.
+        _transfer(destination, source, set())
         return True
 
     def batches(self, limit: int = 20) -> list[FileBatch]:

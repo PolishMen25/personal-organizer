@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -891,8 +892,35 @@ def test_apply_refuse_un_deplacement_relatif(conn, tmp_path, monkeypatch):
 # --- Déplacement interrompu : ne jamais effacer ce qui peut être la seule copie
 
 
-def _journal_vide(conn) -> bool:
-    return conn.execute("SELECT COUNT(*) AS n FROM file_moves").fetchone()["n"] == 0
+def _journal(conn) -> list[tuple[str, str]]:
+    """Lignes encore annulables du journal, (source, destination)."""
+    return [(row["src"], row["dst"]) for row in conn.execute("SELECT src, dst FROM file_moves WHERE undone = 0")]
+
+
+def _liaison_coupee(monkeypatch, dossier: Path, deplacer) -> None:
+    """`shutil.move` remplacé par `deplacer`, et `dossier` illisible : un partage
+    réseau ou une clé USB qui ne répond plus."""
+    vrai_listdir = os.listdir
+
+    def listdir(chemin="."):
+        if str(chemin) == str(dossier):
+            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+        return vrai_listdir(chemin)
+
+    monkeypatch.setattr(module_files.shutil, "move", deplacer)
+    monkeypatch.setattr(module_files.os, "listdir", listdir)
+
+
+def _cle_retiree_pendant_la_copie(monkeypatch, source: Path, fichier: Path, octets: int) -> None:
+    """La copie écrit `octets` octets, puis la clé disparaît : l'original ne répond plus."""
+
+    def copie_puis_cle_retiree(_origine, destination, **_extra):
+        Path(destination).write_text("V" * octets, encoding="utf-8")
+        raise OSError(5, "Input/output error")
+
+    vrai_is_regular = module_files._is_regular
+    _liaison_coupee(monkeypatch, source, copie_puis_cle_retiree)
+    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == fichier else vrai_is_regular(p))
 
 
 @pytest.mark.parametrize(
@@ -902,81 +930,87 @@ def _journal_vide(conn) -> bool:
         5000,  # copie complète, mais la suppression de l'original échoue : la clé a disparu
     ],
 )
-def test_source_injoignable_copie_gardee_sans_etre_journalisee(conn, tmp_path, root, monkeypatch, octets_copies):
-    """Une source qui ne répond plus n'a pas forcément disparu, ni survécu.
-    Journaliser la copie ferait buter l'annulation sans fin sur l'original
-    revenu ; l'effacer perdrait peut-être la seule. Elle est donc gardée, sous
-    un nom qui ne la fait pas passer pour un rangement réussi."""
+def test_source_injoignable_copie_gardee_et_journalisee(conn, tmp_path, root, monkeypatch, octets_copies):
+    """Une source qui ne répond plus n'a pas forcément disparu, ni survécu. La
+    copie est gardée (l'effacer perdrait peut-être la seule), renommée pour ne
+    pas passer pour un rangement réussi, et journalisée pour rester annulable."""
     source = tmp_path / "Clé"
     fichier = _write(source / "vacances.mp4", "V" * 5000)
     organizer = FileOrganizer(conn, [Rule("Vidéos", "Videos", ["mp4"])], root)
     plan = organizer.plan(source)
-
-    def copie_puis_cle_retiree(_origine, destination, **_extra):
-        Path(destination).write_text("V" * octets_copies, encoding="utf-8")
-        raise OSError(5, "Input/output error")
-
-    vrai_is_regular = module_files._is_regular
-    vrai_listdir = os.listdir
-
-    def listdir_cle_retiree(chemin="."):
-        if str(chemin) == str(source):
-            raise OSError(2, "Lecteur introuvable")
-        return vrai_listdir(chemin)
-
-    monkeypatch.setattr(module_files.shutil, "move", copie_puis_cle_retiree)
-    # La clé ne répond plus : l'original paraît absent et son dossier est illisible.
-    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == fichier else vrai_is_regular(p))
-    monkeypatch.setattr(module_files.os, "listdir", listdir_cle_retiree)
+    _cle_retiree_pendant_la_copie(monkeypatch, source, fichier, octets_copies)
 
     organizer.apply(plan)
 
+    gardee = root / "Videos" / "vacances (copie à vérifier).mp4"
     assert [chemin.name for chemin, _ in organizer.last_failures] == ["vacances.mp4"]
     assert "copie est conservée" in organizer.last_failures[0][1]
+    assert organizer.last_kept_copies == [gardee]
     assert not (root / "Videos" / "vacances.mp4").exists()
-    gardee = root / "Videos" / "vacances (copie à vérifier).mp4"
     assert gardee.read_text(encoding="utf-8") == "V" * octets_copies
-    assert _journal_vide(conn)
+    assert _journal(conn) == [(str(fichier), str(gardee))]
     assert fichier.read_text(encoding="utf-8") == "V" * 5000
 
 
-def test_coupure_reseau_apres_suppression_de_l_original_ne_perd_pas_le_fichier(conn, tmp_path, root, monkeypatch):
-    """Constat bloquant : le partage exécute la suppression de l'original, puis la
-    liaison tombe avant la réponse. L'original n'existe plus ; effacer la copie,
-    faute de pouvoir relire le dossier source, faisait perdre le fichier pour de
-    bon. Rien ne distingue ce cas d'une clé retirée : dans le doute, on garde."""
+def test_coupure_reseau_apres_suppression_de_l_original_copie_gardee_et_annulable(conn, tmp_path, root, monkeypatch):
+    """Constat bloquant, relevé deux fois : le partage exécute la suppression de
+    l'original, puis la liaison tombe avant la réponse. Effacer la copie perdait
+    le fichier ; ne pas la journaliser le rendait inannulable, alors qu'il
+    l'était sur main. Gardée et journalisée, elle revient à la place de
+    l'original dès que la liaison est rétablie."""
     source = tmp_path / "NAS"
     fichier = _write(source / "contrat.pdf", "C" * 4000)
     organizer = FileOrganizer(conn, [Rule("Contrats", "Contrats", ["pdf"])], root)
     plan = organizer.plan(source)
-    vrai_move = _VRAI_MOVE
-    vrai_listdir = os.listdir
 
     def deplace_puis_liaison_coupee(origine, destination, **extra):
-        vrai_move(origine, destination, **extra)  # copie ET suppression de l'original
+        _VRAI_MOVE(origine, destination, **extra)  # copie ET suppression de l'original
         raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
 
-    def listdir_partage_coupe(chemin="."):
-        if str(chemin) == str(source):
-            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
-        return vrai_listdir(chemin)
+    _liaison_coupee(monkeypatch, source, deplace_puis_liaison_coupee)
+    batch_id = organizer.apply(plan)
 
-    monkeypatch.setattr(module_files.shutil, "move", deplace_puis_liaison_coupee)
-    monkeypatch.setattr(module_files.os, "listdir", listdir_partage_coupe)
-
-    organizer.apply(plan)
-
-    assert not fichier.exists()  # l'original a bien disparu du partage
     gardee = root / "Contrats" / "contrat (copie à vérifier).pdf"
+    assert not fichier.exists()  # l'original a bien disparu du partage
     assert gardee.read_text(encoding="utf-8") == "C" * 4000  # la seule copie survit
     assert "copie est conservée" in organizer.last_failures[0][1]
-    assert _journal_vide(conn)
+
+    monkeypatch.undo()  # la liaison est rétablie
+    assert [lot.count for lot in organizer.batches()] == [1]
+    assert organizer.undo(batch_id) == 1
+    assert fichier.read_text(encoding="utf-8") == "C" * 4000
+    assert not gardee.exists()
+    assert organizer.batches() == []
+
+
+def test_original_revenu_l_annulation_n_ecrase_rien_puis_se_solde(conn, tmp_path, root, monkeypatch):
+    """La clé est rebranchée : l'original est là, intact, et la copie gardée à
+    côté. L'annulation refuse d'écraser ; une fois le doublon écarté par
+    l'utilisateur, elle solde le lot au lieu de le proposer sans fin."""
+    source = tmp_path / "Clé"
+    fichier = _write(source / "vacances.mp4", "V" * 5000)
+    organizer = FileOrganizer(conn, [Rule("Vidéos", "Videos", ["mp4"])], root)
+    plan = organizer.plan(source)
+    _cle_retiree_pendant_la_copie(monkeypatch, source, fichier, 1000)
+    batch_id = organizer.apply(plan)
+    monkeypatch.undo()  # la clé est rebranchée
+
+    gardee = root / "Videos" / "vacances (copie à vérifier).mp4"
+    assert organizer.undo(batch_id) == 0
+    assert "occupé par un autre fichier" in organizer.last_failures[0][1]
+    assert fichier.read_text(encoding="utf-8") == "V" * 5000  # rien n'est écrasé
+    assert gardee.read_text(encoding="utf-8") == "V" * 1000
+
+    gardee.unlink()  # l'utilisateur a vérifié l'original et écarte le doublon
+    assert organizer.undo(batch_id) == 0
+    assert organizer.last_failures == []
+    assert organizer.batches() == []
 
 
 def test_original_disparu_et_copie_incomplete_la_copie_est_gardee(conn, tmp_path, root, monkeypatch):
     """L'original a disparu (dossier lisible, fichier absent), mais la copie n'a
     pas la taille relevée : ce n'est pas un succès, et c'est pourtant la seule
-    trace qui reste. On la garde plutôt que de l'effacer."""
+    trace qui reste. On la garde, et on la journalise."""
     source = tmp_path / "Entrée"
     fichier = _write(source / "rapport.pdf", "R" * 3000)
     organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
@@ -991,36 +1025,29 @@ def test_original_disparu_et_copie_incomplete_la_copie_est_gardee(conn, tmp_path
 
     organizer.apply(plan)
 
+    gardee = root / "PDF" / "rapport (copie à vérifier).pdf"
     assert not fichier.exists()
-    assert (root / "PDF" / "rapport (copie à vérifier).pdf").read_text(encoding="utf-8") == "R" * 1000
+    assert gardee.read_text(encoding="utf-8") == "R" * 1000
     assert "copie est conservée" in organizer.last_failures[0][1]
-    assert _journal_vide(conn)
+    assert _journal(conn) == [(str(fichier), str(gardee))]
 
 
 def test_copie_gardee_sous_son_nom_si_le_renommage_echoue(conn, tmp_path, root, monkeypatch):
     """Le renommage n'est qu'un signal : s'il échoue, la copie reste sous son nom
     et le message la désigne, mais rien n'est effacé."""
     source = tmp_path / "NAS"
-    _write(source / "contrat.pdf", "C" * 4000)
+    fichier = _write(source / "contrat.pdf", "C" * 4000)
     organizer = FileOrganizer(conn, [Rule("Contrats", "Contrats", ["pdf"])], root)
     plan = organizer.plan(source)
-    vrai_move = _VRAI_MOVE
-    vrai_listdir = os.listdir
 
     def deplace_puis_liaison_coupee(origine, destination, **extra):
-        vrai_move(origine, destination, **extra)
+        _VRAI_MOVE(origine, destination, **extra)
         raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
-
-    def listdir_partage_coupe(chemin="."):
-        if str(chemin) == str(source):
-            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
-        return vrai_listdir(chemin)
 
     def renommage_refuse(*_args, **_kwargs):
         raise PermissionError(13, "Accès refusé")
 
-    monkeypatch.setattr(module_files.shutil, "move", deplace_puis_liaison_coupee)
-    monkeypatch.setattr(module_files.os, "listdir", listdir_partage_coupe)
+    _liaison_coupee(monkeypatch, source, deplace_puis_liaison_coupee)
     monkeypatch.setattr(module_files.os, "rename", renommage_refuse)
 
     organizer.apply(plan)
@@ -1028,7 +1055,139 @@ def test_copie_gardee_sous_son_nom_si_le_renommage_echoue(conn, tmp_path, root, 
     gardee = root / "Contrats" / "contrat.pdf"
     assert gardee.read_text(encoding="utf-8") == "C" * 4000
     assert str(gardee) in organizer.last_failures[0][1]
-    assert _journal_vide(conn)
+    assert _journal(conn) == [(str(fichier), str(gardee))]
+
+
+def _unlink_facon_windows(monkeypatch) -> None:
+    """Windows refuse d'effacer un fichier en lecture seule ; Linux l'accepte."""
+    vrai_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        try:
+            mode = self.stat().st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not mode & stat.S_IWRITE:
+            raise PermissionError(13, "Accès refusé", str(self))
+        return vrai_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+
+def test_copie_en_lecture_seule_retiree_quand_l_original_reste(conn, tmp_path, root, monkeypatch):
+    """Constat : vers un autre volume, la copie reprend l'attribut lecture seule
+    de l'original, que Windows refuse d'effacer. L'échec était avalé : la copie
+    restait sous le nom canonique, et chaque essai en ajoutait une autre."""
+    source = tmp_path / "Clé"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    os.chmod(fichier, stat.S_IREAD)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def copie_puis_original_indelebile(origine, destination, **_extra):
+        shutil.copy2(origine, destination)  # recopie l'attribut lecture seule
+        raise PermissionError(13, "Accès refusé", str(origine))
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_puis_original_indelebile)
+    _unlink_facon_windows(monkeypatch)
+    try:
+        for _essai in range(3):
+            organizer.apply(plan)
+            assert len(organizer.last_failures) == 1
+    finally:
+        os.chmod(fichier, stat.S_IREAD | stat.S_IWRITE)
+
+    assert list((root / "PDF").iterdir()) == []  # ni copie, ni doublons accumulés
+    assert _journal(conn) == []
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
+def test_copie_en_trop_indelebile_renommee_quand_l_original_reste(conn, tmp_path, root, monkeypatch):
+    """Si notre copie résiste vraiment à l'effacement (partage coupé), elle ne
+    doit pas rester sous le nom canonique, où elle passerait pour un rangement
+    réussi : elle est renommée et le message la désigne."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+    cible = root / "PDF" / "facture.pdf"
+
+    def copie_puis_echec(origine, destination, **_extra):
+        shutil.copy2(origine, destination)
+        raise OSError(5, "Input/output error")
+
+    vrai_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self == cible:
+            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+        return vrai_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_puis_echec)
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    organizer.apply(plan)
+
+    en_trop = root / "PDF" / "facture (copie à vérifier).pdf"
+    assert not cible.exists()
+    assert en_trop.is_file()
+    assert "copie en trop" in organizer.last_failures[0][1]
+    assert str(en_trop) in organizer.last_failures[0][1]
+    assert _journal(conn) == []
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
+def test_annulation_d_un_fichier_ouvert_ne_laisse_ni_doublon_ni_lot_bloque(conn, tmp_path, root, monkeypatch):
+    """Constat : un fichier rangé puis ouvert dans Word. Le renommage bute sur le
+    verrou, `shutil.move` se replie sur une copie, puis ne peut pas effacer le
+    fichier ouvert. Une copie restait sous le nom d'origine, et chaque
+    annulation suivante était refusée : « occupé par un autre fichier »."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "rapport.docx", "W" * 3000)
+    organizer = FileOrganizer(conn, [Rule("Docs", "Docs", ["docx"])], root)
+    batch_id = organizer.apply(organizer.plan(source))
+    range_ = root / "Docs" / "rapport.docx"
+    assert range_.is_file()
+
+    def copie_puis_verrou(origine, destination, **_extra):
+        shutil.copy2(origine, destination)  # Word autorise la lecture
+        raise PermissionError(32, "Le processus ne peut pas accéder au fichier", str(origine))
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_puis_verrou)
+    assert organizer.undo(batch_id) == 0
+    assert not fichier.exists()  # aucun doublon sous le nom d'origine
+    assert range_.read_text(encoding="utf-8") == "W" * 3000
+    assert [lot.count for lot in organizer.batches()] == [1]
+
+    monkeypatch.undo()  # Word est fermé
+    assert organizer.undo(batch_id) == 1
+    assert fichier.read_text(encoding="utf-8") == "W" * 3000
+    assert not range_.exists()
+
+
+def test_destination_illisible_le_message_nomme_les_deux_emplacements(conn, tmp_path, root, monkeypatch):
+    """Renommage exécuté par le serveur, puis liaison coupée : ni la source ni la
+    destination ne répondent. Le message ne citait que la source, alors que le
+    fichier était peut-être déjà rangé."""
+    source = tmp_path / "Partage"
+    fichier = _write(source / "bilan.xlsx", "B" * 1000)
+    organizer = FileOrganizer(conn, [Rule("Tableurs", "Tableurs", ["xlsx"])], root)
+    plan = organizer.plan(source)
+    cible = root / "Tableurs" / "bilan.xlsx"
+
+    def deplace_puis_liaison_coupee(origine, destination, **extra):
+        _VRAI_MOVE(origine, destination, **extra)
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    vrai_is_regular = module_files._is_regular
+    _liaison_coupee(monkeypatch, source, deplace_puis_liaison_coupee)
+    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == cible else vrai_is_regular(p))
+
+    organizer.apply(plan)
+
+    message = organizer.last_failures[0][1]
+    assert str(fichier) in message
+    assert str(cible) in message
 
 
 # --- Destinations saisies avec des espaces ou un point final -----------------
