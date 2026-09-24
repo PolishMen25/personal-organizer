@@ -102,7 +102,11 @@ def EmptyState(message: str, hint: str = "") -> QWidget:
     layout = QVBoxLayout(container)
     layout.setContentsMargins(MARGIN, MARGIN * 2, MARGIN, MARGIN * 2)
     layout.setSpacing(6)
-    layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    # Pas de `layout.setAlignment` : il ramènerait chaque libellé à sa largeur
+    # préférée, et un QLabel à retour à la ligne n'y obtient plus la hauteur
+    # dont il a besoin — le texte d'aide était rogné. Les libellés prennent
+    # toute la largeur (leur texte reste centré) ; des ressorts centrent en hauteur.
+    layout.addStretch(1)
 
     label = QLabel(text)
     label.setWordWrap(True)
@@ -119,6 +123,7 @@ def EmptyState(message: str, hint: str = "") -> QWidget:
         note.setStyleSheet(f"color: {COLORS['text_dim']}; background: transparent;")
         layout.addWidget(note)
 
+    layout.addStretch(1)
     return container
 
 

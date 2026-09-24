@@ -17,9 +17,11 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QCheckBox,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -41,6 +43,7 @@ from organizer.ui.notes_tab import (
 )
 from organizer.ui.tasks_tab import TasksTab
 from organizer.ui.theme import COLORS
+from organizer.ui.today_tab import EMPTY_HINT as TODAY_EMPTY_HINT
 from organizer.ui.today_tab import TodayTab
 from organizer.ui.widgets import EmptyState, SectionHeader, card, styled_button
 
@@ -186,6 +189,40 @@ def test_la_fenetre_expose_les_cinq_onglets(window: MainWindow) -> None:
     for tab in onglets:
         assert hasattr(tab, "dataChanged"), f"{type(tab).__name__} n'expose pas dataChanged"
         tab.refresh()  # relecture complète : aucune exception ne doit remonter
+
+
+def _libelles_rognes(racine: QWidget) -> list[str]:
+    """Libellés à retour à la ligne qui reçoivent moins de hauteur qu'il ne leur en faut."""
+    return [
+        label.text()[:40]
+        for label in racine.findChildren(QLabel)
+        if label.isVisible() and label.wordWrap() and label.height() < label.heightForWidth(label.width())
+    ]
+
+
+@pytest.mark.parametrize("largeur", [420, 800, 1400])
+def test_etat_vide_jamais_rogne(qapp, pump, largeur) -> None:
+    """Constat (capture sous Windows) : sous « Rien d'urgent. », le texte d'aide
+    était coupé. L'alignement du layout ramenait chaque libellé à sa largeur
+    préférée, où un QLabel à retour à la ligne n'obtient pas sa hauteur."""
+    hote = QWidget()
+    layout = QVBoxLayout(hote)
+    layout.addWidget(EmptyState("Rien d'urgent.", TODAY_EMPTY_HINT))
+    layout.addStretch(1)
+    hote.resize(largeur, 600)
+    hote.show()
+    pump()
+    try:
+        assert _libelles_rognes(hote) == []
+    finally:
+        hote.close()
+
+
+def test_onglet_aujourd_hui_vide_lisible_en_entier(window: MainWindow, pump) -> None:
+    window.resize(1050, 780)
+    window.show()
+    pump()
+    assert _libelles_rognes(_onglet(window, TodayTab)) == []
 
 
 def test_le_contrat_d_interface_est_respecte(qapp) -> None:
