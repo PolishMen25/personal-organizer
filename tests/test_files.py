@@ -1468,3 +1468,107 @@ def test_extension_composee_est_reconnue(tmp_path):
     assert regle.matches(_write(tmp_path / "sauvegarde.tar.gz"))
     assert regle.matches(_write(tmp_path / "base.2026.tar.gz"))
     assert not regle.matches(_write(tmp_path / "sauvegarde.gz"))
+
+
+# --- Dossiers connus de Windows (Documents redirigé vers OneDrive) ------------
+
+
+@pytest.fixture()
+def poste_onedrive(tmp_path):
+    """Poste d'entreprise : Documents et Images redirigés vers OneDrive."""
+    maison = tmp_path / "Users" / "v.jourdan"
+    onedrive = maison / "OneDrive - VIE ET VERANDA"
+    return maison, {"documents": onedrive / "Documents", "pictures": onedrive / "Images"}
+
+
+def test_une_regle_documents_suit_la_redirection_onedrive(conn, tmp_path, poste_onedrive):
+    """Constat sur le poste de l'utilisateur : des .csv du Bureau OneDrive
+    allaient partir dans C:\\Users\\…\\Documents, hors de OneDrive, qui les
+    aurait crus supprimés du cloud. « Documents » doit suivre Windows."""
+    maison, connus = poste_onedrive
+    source = connus["documents"].parent / "Bureau" / "comparaison"
+    _write(source / "export.csv")
+    _write(source / "glpi.csv")
+    _write(source / "sauvegarde.zip")
+    organizer = FileOrganizer(conn, DEFAULT_RULES, maison, known=connus)
+
+    destinations = {move.src.name: move.dst for move in organizer.plan(source)}
+
+    assert destinations["export.csv"] == connus["documents"] / "Tableurs" / "export.csv"
+    assert destinations["glpi.csv"] == connus["documents"] / "Tableurs" / "glpi.csv"
+    # « Archives » n'est pas un dossier connu : il reste sous la racine.
+    assert destinations["sauvegarde.zip"] == maison / "Archives" / "sauvegarde.zip"
+
+
+@pytest.mark.parametrize(
+    ("destination", "attendu"),
+    [
+        ("Pictures/Vacances", ("pictures", "Vacances")),
+        ("Images/Vacances", ("pictures", "Vacances")),  # nom français de l'Explorateur
+        ("documents/Factures", ("documents", "Factures")),  # casse indifférente
+        ("Logiciels/Installeurs", None),
+    ],
+)
+def test_destination_folder_dossiers_connus_et_alias(conn, poste_onedrive, destination, attendu):
+    maison, connus = poste_onedrive
+    organizer = FileOrganizer(conn, [], maison, known=connus)
+    dossier = organizer.destination_folder(Rule("R", destination, ["pdf"]))
+    if attendu is None:
+        assert dossier == maison.joinpath(*destination.split("/"))
+    else:
+        assert dossier == connus[attendu[0]] / attendu[1]
+
+
+def test_rangement_vers_documents_redirige_puis_annulation(conn, poste_onedrive):
+    maison, connus = poste_onedrive
+    source = maison / "Downloads"
+    fichier = _write(source / "releve.xlsx", "R" * 100)
+    organizer = FileOrganizer(conn, DEFAULT_RULES, maison, known=connus)
+
+    batch_id = organizer.apply(organizer.plan(source))
+
+    range_ = connus["documents"] / "Tableurs" / "releve.xlsx"
+    assert range_.read_text(encoding="utf-8") == "R" * 100
+    assert not (maison / "Documents").exists()  # rien hors de OneDrive
+    assert organizer.undo(batch_id) == 1
+    assert fichier.read_text(encoding="utf-8") == "R" * 100
+
+
+def test_racine_imposee_ignore_les_dossiers_connus(conn, tmp_path, monkeypatch):
+    """Une racine imposée (tests, réglage explicite) garde toutes les règles
+    sous elle ; sans racine, l'application interroge Windows."""
+    appels = []
+    monkeypatch.setattr(module_files, "known_folders", lambda: appels.append(1) or {"documents": tmp_path / "OD"})
+    assert FileOrganizer(conn, [], tmp_path).known_folders == {}
+    assert appels == []
+    assert FileOrganizer(conn, []).known_folders == {"documents": tmp_path / "OD"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="dossiers connus : API Windows")
+def test_known_folders_interroge_vraiment_windows():
+    """Exécuté sur la CI Windows : l'appel ctypes à SHGetKnownFolderPath doit
+    rendre de vrais dossiers, et au moins Documents."""
+    connus = module_files.known_folders()
+    assert "documents" in connus
+    for dossier in connus.values():
+        assert dossier.is_absolute()
+    assert connus["documents"].is_dir()
+
+
+def test_known_folders_vide_hors_de_windows(monkeypatch):
+    monkeypatch.setattr(module_files, "_windows", lambda: False)
+    assert module_files.known_folders() == {}
+
+
+def test_imposer_une_racine_apres_coup_ignore_les_dossiers_connus(conn, tmp_path):
+    """Constat (CI Windows) : les tests imposent leur racine après avoir ouvert le
+    contexte comme l'application, donc avec les vrais dossiers du poste. Les
+    fichiers de test partaient dans le vrai Documents du runner."""
+    source = tmp_path / "Entrée"
+    _write(source / "export.csv")
+    organizer = FileOrganizer(conn, DEFAULT_RULES, known={"documents": tmp_path / "Vrai Documents"})
+    organizer.target_root = tmp_path / "Essai"
+
+    assert organizer.known_folders == {}
+    [move] = organizer.plan(source)
+    assert move.dst == tmp_path / "Essai" / "Documents" / "Tableurs" / "export.csv"

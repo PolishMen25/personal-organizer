@@ -975,3 +975,17 @@ def test_un_rangement_interrompu_annonce_le_nombre_reel(
         f"doc{index}.pdf" for index in range(8)
     )
     assert ctx.files.batches() == []
+
+
+def test_note_documents_redirige_affichee(tmp_path) -> None:
+    """L'interface annonce où va réellement « Documents » quand Windows l'a
+    redirigé : l'utilisateur voit que ses fichiers restent dans OneDrive."""
+    from organizer.files import FileOrganizer
+    from organizer.db import connect
+
+    maison = tmp_path / "v.jourdan"
+    onedrive = maison / "OneDrive - VIE ET VERANDA" / "Documents"
+    redirige = FileOrganizer(connect(":memory:"), [], maison, known={"documents": onedrive})
+    assert str(onedrive) in module_files_tab._known_note(redirige)
+    standard = FileOrganizer(connect(":memory:"), [], maison, known={"documents": maison / "Documents"})
+    assert module_files_tab._known_note(standard) == ""
