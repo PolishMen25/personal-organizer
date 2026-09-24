@@ -1102,6 +1102,45 @@ def test_copie_en_lecture_seule_retiree_quand_l_original_reste(conn, tmp_path, r
     assert fichier.read_text(encoding="utf-8") == "F" * 2000
 
 
+@pytest.mark.parametrize(
+    "arrondi_ns",
+    [
+        2 * 10**9,  # FAT32 : la date de modification est arrondie à 2 secondes
+        10**7,  # exFAT : à 10 millisecondes
+    ],
+)
+def test_copie_en_lecture_seule_retiree_meme_si_la_cle_arrondit_la_date(conn, tmp_path, root, monkeypatch, arrondi_ns):
+    """Constat : reconnaître notre copie à sa date de modification échouait sur
+    une clé USB en FAT32 ou exFAT, qui l'arrondissent. La copie en lecture
+    seule n'était plus effacée, et chaque essai ajoutait un doublon. C'est le
+    contenu, identique à l'original présent, qui prouve qu'elle n'apporte rien."""
+    source = tmp_path / "Disque"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    os.utime(fichier, ns=(1_700_000_000_123_456_789, 1_700_000_000_123_456_789))
+    os.chmod(fichier, stat.S_IREAD)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def copie_vers_cle_puis_original_indelebile(origine, destination, **_extra):
+        shutil.copyfile(origine, destination)
+        date = os.stat(origine).st_mtime_ns // arrondi_ns * arrondi_ns
+        os.utime(destination, ns=(date, date))
+        os.chmod(destination, stat.S_IREAD)
+        raise PermissionError(13, "Accès refusé", str(origine))
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_vers_cle_puis_original_indelebile)
+    _unlink_facon_windows(monkeypatch)
+    try:
+        for _essai in range(3):
+            organizer.apply(plan)
+            assert len(organizer.last_failures) == 1
+    finally:
+        os.chmod(fichier, stat.S_IREAD | stat.S_IWRITE)
+
+    assert list((root / "PDF").iterdir()) == []  # ni copie, ni doublons accumulés sur la clé
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
 def test_copie_en_trop_indelebile_renommee_quand_l_original_reste(conn, tmp_path, root, monkeypatch):
     """Si notre copie résiste vraiment à l'effacement (partage coupé), elle ne
     doit pas rester sous le nom canonique, où elle passerait pour un rangement
@@ -1226,17 +1265,19 @@ def test_annulation_incertaine_ne_perd_pas_le_fichier_range_encore_present(conn,
 def test_le_fichier_d_un_autre_logiciel_apparu_a_la_cible_n_est_jamais_efface(conn, tmp_path, root, monkeypatch):
     """Course de quelques microsecondes : un autre logiciel dépose un fichier en
     lecture seule à la cible. Le retrait de la lecture seule, prévu pour NOTRE
-    copie, l'aurait effacé ; la date de modification, que `copy2` recopie à
-    l'identique, le distingue d'une copie de l'original."""
+    copie, l'aurait effacé. Seul un contenu identique à l'original, présent,
+    autorise l'effacement : même avec la date de l'original, un contenu
+    différent reste protégé."""
     source = tmp_path / "Entrée"
     fichier = _write(source / "facture.pdf", "F" * 2000)
     organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
     plan = organizer.plan(source)
 
-    def intrus_puis_echec(_origine, destination, **_extra):
+    def intrus_puis_echec(origine, destination, **_extra):
         intrus = Path(destination)
         intrus.write_text("CONTENU D'UN AUTRE LOGICIEL", encoding="utf-8")
-        os.utime(intrus, ns=(10**9, 10**9))  # une date qui n'est pas celle de l'original
+        date = os.stat(origine)
+        os.utime(intrus, ns=(date.st_atime_ns, date.st_mtime_ns))  # même date que l'original
         os.chmod(intrus, stat.S_IREAD)
         raise PermissionError(13, "Accès refusé", str(destination))
 

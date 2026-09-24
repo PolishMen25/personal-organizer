@@ -11,6 +11,7 @@ pouvoir tourner hors du fil graphique.
 
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import json
 import os
@@ -471,15 +472,15 @@ def _mark_uncertain(path: Path, claimed: set[str]) -> Path:
     return target
 
 
-def _discard(path: Path, origin_mtime_ns: int | None = None) -> bool:
+def _discard(path: Path, origin: Path | None = None) -> bool:
     """Efface NOTRE copie, inachevée ou en trop ; `True` si elle a disparu.
 
     Une copie vers un autre volume reprend l'attribut lecture seule de
-    l'original, et Windows refuse d'effacer un fichier en lecture seule : on
-    le retire d'abord, sur notre copie seulement, jamais sur l'original. La
-    date de modification, que `copy2` recopie à l'identique, confirme que
-    c'est bien notre copie, et pas le fichier d'un autre logiciel apparu à
-    la même place entre-temps.
+    l'original, et Windows refuse d'effacer un fichier en lecture seule. On
+    ne retire l'attribut, jamais sur l'original, que si la copie est identique
+    octet pour octet à `origin`, présent : l'effacer ne perd alors rien, même
+    si c'était le fichier d'un autre logiciel apparu à la même place. La date
+    de modification ne prouverait rien : FAT32 et exFAT l'arrondissent.
     """
     try:
         path.unlink(missing_ok=True)
@@ -489,7 +490,7 @@ def _discard(path: Path, origin_mtime_ns: int | None = None) -> bool:
     except OSError:
         return False
     try:
-        if origin_mtime_ns is None or path.stat().st_mtime_ns != origin_mtime_ns:
+        if origin is None or not filecmp.cmp(origin, path, shallow=False):
             return False
         os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
         path.unlink(missing_ok=True)
@@ -520,10 +521,6 @@ def _transfer(origin: Path, target: Path, claimed: set[str]) -> Path:
     """
     size = _size(origin)
     try:
-        origin_mtime_ns: int | None = origin.stat().st_mtime_ns
-    except OSError:
-        origin_mtime_ns = None
-    try:
         shutil.move(str(origin), str(target))
     except OSError as error:
         present = _source_present(origin)
@@ -532,7 +529,7 @@ def _transfer(origin: Path, target: Path, claimed: set[str]) -> Path:
             # `shutil.move` copie puis supprime. L'original est intact : ce qui se
             # trouve à `target` vient de cette copie (la place était libre) et
             # peut disparaître sans rien perdre.
-            if _discard(target, origin_mtime_ns):
+            if _discard(target, origin):
                 raise
             leftover = _mark_uncertain(target, claimed)
             raise OSError(
