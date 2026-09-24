@@ -821,7 +821,7 @@ class FileOrganizer:
     ):
         self.conn = conn
         self.rules = list(rules)
-        self.target_root = _absolute(target_root if target_root is not None else Path.home())
+        self._target_root = _absolute(target_root if target_root is not None else Path.home())
         # Sans racine imposée, les dossiers connus suivent Windows (Documents
         # redirigé vers OneDrive, par exemple) ; une racine imposée les ignore.
         if known is None:
@@ -832,6 +832,19 @@ class FileOrganizer:
         # Copies gardées faute de savoir si l'original existe encore : elles sont
         # peut-être les seules qui restent, l'interface doit les montrer en premier.
         self.last_kept_copies: list[Path] = []
+
+    @property
+    def target_root(self) -> Path:
+        return self._target_root
+
+    @target_root.setter
+    def target_root(self, value: str | Path) -> None:
+        """Imposer une racine après coup vaut l'imposer à la construction : toutes
+        les règles vont dessous, dossiers connus compris. Sinon, une racine
+        choisie (dossier d'essai, tests) laisserait « Documents/… » filer vers le
+        vrai Documents du poste."""
+        self._target_root = _absolute(value)
+        self.known_folders = {}
 
     def destination_folder(self, rule: Rule) -> Path:
         """Dossier réel visé par une règle.

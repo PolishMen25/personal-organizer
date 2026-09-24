@@ -1558,3 +1558,17 @@ def test_known_folders_interroge_vraiment_windows():
 def test_known_folders_vide_hors_de_windows(monkeypatch):
     monkeypatch.setattr(module_files, "_windows", lambda: False)
     assert module_files.known_folders() == {}
+
+
+def test_imposer_une_racine_apres_coup_ignore_les_dossiers_connus(conn, tmp_path):
+    """Constat (CI Windows) : les tests imposent leur racine après avoir ouvert le
+    contexte comme l'application, donc avec les vrais dossiers du poste. Les
+    fichiers de test partaient dans le vrai Documents du runner."""
+    source = tmp_path / "Entrée"
+    _write(source / "export.csv")
+    organizer = FileOrganizer(conn, DEFAULT_RULES, known={"documents": tmp_path / "Vrai Documents"})
+    organizer.target_root = tmp_path / "Essai"
+
+    assert organizer.known_folders == {}
+    [move] = organizer.plan(source)
+    assert move.dst == tmp_path / "Essai" / "Documents" / "Tableurs" / "export.csv"
