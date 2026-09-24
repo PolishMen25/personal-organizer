@@ -1165,6 +1165,95 @@ def test_annulation_d_un_fichier_ouvert_ne_laisse_ni_doublon_ni_lot_bloque(conn,
     assert not range_.exists()
 
 
+def test_annulation_incertaine_solde_son_lot_et_libere_les_plus_anciens(conn, tmp_path, root, monkeypatch):
+    """Constat (régression) : pendant une annulation, le serveur supprime le
+    fichier rangé puis la liaison tombe. La copie revenue était renommée et la
+    ligne restait ouverte : chaque annulation suivante butait sur « introuvable »,
+    et l'interface, qui annule le lot le plus récent, n'atteignait plus les
+    lots plus anciens. Sur main, la ligne se soldait."""
+    source = tmp_path / "Entrée"
+    ancien = _write(source / "ancien.pdf", "A" * 1000)
+    regles = [Rule("Docs", "Docs", ["pdf", "docx"])]
+    lot_ancien = FileOrganizer(conn, regles, root)
+    lot_ancien_id = lot_ancien.apply(lot_ancien.plan(source))
+    _write(source / "rapport.docx", "W" * 3000)
+    organizer = FileOrganizer(conn, regles, root)
+    batch_id = organizer.apply(organizer.plan(source))
+    range_ = root / "Docs" / "rapport.docx"
+
+    def retour_puis_liaison_coupee(origine, destination, **extra):
+        _VRAI_MOVE(origine, destination, **extra)  # copie ET suppression du fichier rangé
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    _liaison_coupee(monkeypatch, root / "Docs", retour_puis_liaison_coupee)
+    assert organizer.undo(batch_id) == 0
+    monkeypatch.undo()  # la liaison est rétablie
+
+    revenue = source / "rapport (copie à vérifier).docx"
+    assert not range_.exists()
+    assert revenue.read_text(encoding="utf-8") == "W" * 3000  # rien n'est perdu
+    assert organizer.last_kept_copies == [revenue]
+    assert [lot.batch_id for lot in organizer.batches()] == [lot_ancien_id]  # le lot ancien redevient accessible
+    assert organizer.undo(lot_ancien_id) == 1
+    assert ancien.read_text(encoding="utf-8") == "A" * 1000
+
+
+def test_annulation_incertaine_ne_perd_pas_le_fichier_range_encore_present(conn, tmp_path, root, monkeypatch):
+    """Solder la ligne ne doit rien perdre quand le fichier rangé existait encore,
+    simplement injoignable : il reste en place, à côté de la copie revenue."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "rapport.docx", "W" * 3000)
+    organizer = FileOrganizer(conn, [Rule("Docs", "Docs", ["docx"])], root)
+    batch_id = organizer.apply(organizer.plan(source))
+    range_ = root / "Docs" / "rapport.docx"
+
+    def copie_puis_liaison_coupee(origine, destination, **_extra):
+        shutil.copy2(origine, destination)  # le fichier rangé n'est PAS supprimé
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    vrai_is_regular = module_files._is_regular
+    _liaison_coupee(monkeypatch, root / "Docs", copie_puis_liaison_coupee)
+    monkeypatch.setattr(module_files, "_is_regular", lambda p: False if p == range_ else vrai_is_regular(p))
+    organizer.undo(batch_id)
+    monkeypatch.undo()
+
+    assert range_.read_text(encoding="utf-8") == "W" * 3000
+    assert (source / "rapport (copie à vérifier).docx").read_text(encoding="utf-8") == "W" * 3000
+    assert not fichier.exists()  # aucun des deux ne se fait passer pour l'original revenu
+    assert any(str(range_) in message for _, message in organizer.last_failures)
+
+
+def test_le_fichier_d_un_autre_logiciel_apparu_a_la_cible_n_est_jamais_efface(conn, tmp_path, root, monkeypatch):
+    """Course de quelques microsecondes : un autre logiciel dépose un fichier en
+    lecture seule à la cible. Le retrait de la lecture seule, prévu pour NOTRE
+    copie, l'aurait effacé ; la date de modification, que `copy2` recopie à
+    l'identique, le distingue d'une copie de l'original."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "facture.pdf", "F" * 2000)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def intrus_puis_echec(_origine, destination, **_extra):
+        intrus = Path(destination)
+        intrus.write_text("CONTENU D'UN AUTRE LOGICIEL", encoding="utf-8")
+        os.utime(intrus, ns=(10**9, 10**9))  # une date qui n'est pas celle de l'original
+        os.chmod(intrus, stat.S_IREAD)
+        raise PermissionError(13, "Accès refusé", str(destination))
+
+    monkeypatch.setattr(module_files.shutil, "move", intrus_puis_echec)
+    _unlink_facon_windows(monkeypatch)
+
+    organizer.apply(plan)
+
+    restants = list((root / "PDF").iterdir())
+    try:
+        assert [p.read_text(encoding="utf-8") for p in restants] == ["CONTENU D'UN AUTRE LOGICIEL"]
+    finally:
+        for chemin in restants:
+            os.chmod(chemin, stat.S_IREAD | stat.S_IWRITE)
+    assert fichier.read_text(encoding="utf-8") == "F" * 2000
+
+
 def test_destination_illisible_le_message_nomme_les_deux_emplacements(conn, tmp_path, root, monkeypatch):
     """Renommage exécuté par le serveur, puis liaison coupée : ni la source ni la
     destination ne répondent. Le message ne citait que la source, alors que le
