@@ -45,6 +45,7 @@ from ..files import (
     DEFAULT_RULES,
     Cancelled,
     FileBatch,
+    FileOrganizer,
     PlannedMove,
     Progress,
     Rule,
@@ -169,6 +170,14 @@ def _read_only(text: str) -> QTableWidgetItem:
     return item
 
 
+def _known_note(files: FileOrganizer) -> str:
+    """Précise où est « Documents » quand Windows l'a déplacé (OneDrive, réseau)."""
+    documents = files.known_folders.get("documents")
+    if documents is None or documents == files.target_root / "Documents":
+        return ""
+    return f" ; « Documents » suit Windows : « {documents} »"
+
+
 def _destination_text(move: PlannedMove, root: Path) -> str:
     """Dossier d'arrivée relatif à la racine, et le nom de repli si la cible était prise."""
     folder = move.dst.parent
@@ -251,7 +260,8 @@ class RulesDialog(QDialog):
         root.addWidget(
             _dim(
                 "L'ordre compte : la première règle qui correspond l'emporte. Les destinations sont "
-                f"relatives à « {self.ctx.files.target_root} ». Extensions et motifs se séparent par "
+                f"relatives à « {self.ctx.files.target_root} »{_known_note(self.ctx.files)}. "
+                "Extensions et motifs se séparent par "
                 "des virgules ; un motif accepte « * », comme « *facture* »."
             )
         )
@@ -484,8 +494,8 @@ class FilesTab(QWidget):
         layout.addLayout(self._build_folder_row())
         layout.addWidget(
             _dim(
-                f"Les fichiers sont déplacés vers « {self.ctx.files.target_root} » selon vos règles. "
-                "Rien n'est écrasé, rien n'est supprimé."
+                f"Les fichiers sont déplacés vers « {self.ctx.files.target_root} » selon vos règles"
+                f"{_known_note(self.ctx.files)}. Rien n'est écrasé, rien n'est supprimé."
             )
         )
         self._plan_status = _dim()

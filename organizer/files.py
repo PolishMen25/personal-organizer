@@ -625,6 +625,62 @@ def _name_length(name: str) -> int:
     return len(os.fsencode(name))
 
 
+# Dossiers connus de Windows, par nom de premier dossier d'une destination (anglais,
+# comme sur le disque, ou français, comme dans l'Explorateur). Sur un poste
+# d'entreprise, « Documents » est souvent redirigé vers OneDrive : une règle
+# « Documents/… » doit suivre cette redirection, sinon les fichiers sortiraient
+# du dossier synchronisé et OneDrive les croirait supprimés.
+_KNOWN_FOLDER_IDS = {
+    "documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
+    "pictures": "33E28130-4E1E-4676-835A-98395C3BC3BB",
+    "videos": "18989B1D-99B5-455B-841C-AB7C74E4DDFC",
+    "music": "4BD8D571-6D19-48D3-BE97-422220080E43",
+    "desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
+    "downloads": "374DE290-123F-4565-9164-39C4925E467B",
+}
+_KNOWN_FOLDER_ALIASES = {
+    "images": "pictures",
+    "vidéos": "videos",
+    "musique": "music",
+    "bureau": "desktop",
+    "téléchargements": "downloads",
+}
+
+
+def known_folders() -> dict[str, Path]:
+    """Emplacement réel des dossiers connus de Windows, par nom en minuscules.
+
+    Vide hors de Windows, ou pour un dossier que Windows ne sait pas situer :
+    la destination retombe alors sous la racine de rangement.
+    """
+    if not _windows():
+        return {}
+    folders: dict[str, Path] = {}
+    try:
+        import ctypes
+        import uuid
+        from ctypes import wintypes
+
+        get_path = ctypes.WinDLL("shell32").SHGetKnownFolderPath
+        get_path.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+        get_path.restype = ctypes.c_long  # HRESULT
+        free = ctypes.WinDLL("ole32").CoTaskMemFree
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = None
+        for name, guid in _KNOWN_FOLDER_IDS.items():
+            folder_id = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(guid).bytes_le)
+            found = ctypes.c_wchar_p()
+            result = get_path(ctypes.byref(folder_id), 0, None, ctypes.byref(found))
+            try:
+                if result == 0 and found.value:
+                    folders[name] = Path(found.value)
+            finally:
+                free(found)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return folders
+
+
 @cache
 def _long_paths_enabled() -> bool:
     """Vrai si ce processus peut dépasser MAX_PATH.
@@ -761,15 +817,33 @@ class FileOrganizer:
         conn: sqlite3.Connection,
         rules: list[Rule],
         target_root: str | Path | None = None,
+        known: dict[str, Path] | None = None,
     ):
         self.conn = conn
         self.rules = list(rules)
         self.target_root = _absolute(target_root if target_root is not None else Path.home())
+        # Sans racine imposée, les dossiers connus suivent Windows (Documents
+        # redirigé vers OneDrive, par exemple) ; une racine imposée les ignore.
+        if known is None:
+            known = known_folders() if target_root is None else {}
+        self.known_folders = {name.casefold(): _absolute(path) for name, path in known.items()}
         # Échecs (chemin, message) du dernier `apply()` ou `undo()`, à montrer à l'utilisateur.
         self.last_failures: list[tuple[Path, str]] = []
         # Copies gardées faute de savoir si l'original existe encore : elles sont
         # peut-être les seules qui restent, l'interface doit les montrer en premier.
         self.last_kept_copies: list[Path] = []
+
+    def destination_folder(self, rule: Rule) -> Path:
+        """Dossier réel visé par une règle.
+
+        Un premier dossier connu (« Documents », « Pictures », « Images »…) suit
+        l'emplacement que Windows lui donne ; les autres restent sous la racine.
+        """
+        head, *rest = rule.destination.split("/")
+        known = self.known_folders.get(_KNOWN_FOLDER_ALIASES.get(head.casefold(), head.casefold()))
+        if known is not None:
+            return known.joinpath(*rest)
+        return self.target_root.joinpath(head, *rest)
 
     def plan(
         self,
@@ -796,7 +870,7 @@ class FileOrganizer:
             rule = self._first_match(path, today)
             if rule is None:
                 continue
-            destination_folder = self.target_root.joinpath(*rule.destination.split("/"))
+            destination_folder = self.destination_folder(rule)
             try:
                 if _same_folder(path.parent, destination_folder):
                     continue  # déjà rangé

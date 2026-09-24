@@ -81,17 +81,29 @@ Ce sont celles que l'application écrit dans un fichier neuf. Toutes ont `min_ag
 
 Un fichier qui ne correspond à aucune règle reste où il est : rien n'est déplacé « par défaut ».
 
-### Pourquoi `Pictures` et non « Images »
+### Documents, Images… suivent les dossiers de Windows
 
-Les destinations portent le nom des dossiers **sur le disque**, pas leur nom affiché. Les
-bibliothèques Windows s'appellent `Pictures`, `Videos` et `Music` ; l'explorateur les montre
-traduites en « Images », « Vidéos » et « Musique ». Écrire les noms français créerait trois
-dossiers neufs *à côté* des vraies bibliothèques — celles qui sont indexées, sauvegardées et
-proposées par les autres applications.
+Quand une destination commence par un dossier connu de Windows, l'application demande à
+Windows où il se trouve réellement (`SHGetKnownFolderPath`), comme le fait l'Explorateur :
 
-Une réserve subsiste pour `Documents` : si la « Sauvegarde des dossiers » de OneDrive est active,
-le vrai dossier est `%USERPROFILE%\OneDrive\Documents`. Dans ce cas, changez la destination des
-règles concernées en `OneDrive/Documents/…` depuis le bouton *Règles…*.
+| Premier dossier de la destination | Dossier Windows |
+|---|---|
+| `Documents` | Documents |
+| `Pictures` ou `Images` | Images |
+| `Videos` ou `Vidéos` | Vidéos |
+| `Music` ou `Musique` | Musique |
+| `Desktop` ou `Bureau` | Bureau |
+| `Downloads` ou `Téléchargements` | Téléchargements |
+
+C'est indispensable sur un poste d'entreprise où ces dossiers sont redirigés vers OneDrive
+(`OneDrive - <entreprise>\Documents`) : la règle `Documents/Tableurs` range alors bien dans le
+Documents de OneDrive. Sans cela, les fichiers sortiraient du dossier synchronisé, et OneDrive
+les croirait supprimés du cloud. L'onglet *Fichiers* indique où se trouve « Documents » quand il
+a été redirigé.
+
+Les autres destinations (`Archives`, `Logiciels/…`, `Développement/…`) restent sous votre dossier
+personnel, `%USERPROFILE%`. Si vos fichiers sont dans OneDrive et doivent y rester, faites
+commencer ces règles par `Documents/` depuis le bouton *Règles…*, par exemple `Documents/Archives`.
 
 ## Deux exemples de règles personnalisées
 
