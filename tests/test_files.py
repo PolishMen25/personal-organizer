@@ -694,7 +694,10 @@ def test_le_suffixe_de_collision_ne_fait_pas_depasser_la_limite(tmp_path, stat_f
         module_files._free_path(dossier, nom, claimed)
 
 
-def test_un_nom_a_la_limite_reste_accepte(tmp_path):
+def test_un_nom_a_la_limite_reste_accepte(tmp_path, monkeypatch):
+    # Le chemin complet dépasse 259 caractères : sur un Windows aux réglages
+    # d'usine, c'est la limite de chemin qui répondrait, pas celle du nom.
+    monkeypatch.setattr(module_files, "_long_paths_enabled", lambda: True)
     nom = "a" * (module_files.MAX_NAME_LENGTH - len(".pdf")) + ".pdf"
     assert module_files._free_path(tmp_path, nom, set()) == tmp_path / nom
 
@@ -885,7 +888,11 @@ def test_apply_refuse_un_deplacement_relatif(conn, tmp_path, monkeypatch):
     assert conn.execute("SELECT COUNT(*) AS n FROM file_moves").fetchone()["n"] == 0
 
 
-# --- Source injoignable pendant un déplacement --------------------------------
+# --- Déplacement interrompu : ne jamais effacer ce qui peut être la seule copie
+
+
+def _journal_vide(conn) -> bool:
+    return conn.execute("SELECT COUNT(*) AS n FROM file_moves").fetchone()["n"] == 0
 
 
 @pytest.mark.parametrize(
@@ -895,12 +902,11 @@ def test_apply_refuse_un_deplacement_relatif(conn, tmp_path, monkeypatch):
         5000,  # copie complète, mais la suppression de l'original échoue : la clé a disparu
     ],
 )
-def test_apply_ne_conclut_pas_au_succes_quand_la_source_est_injoignable(
-    conn, tmp_path, root, monkeypatch, octets_copies
-):
-    """Une source qui ne répond plus n'a pas forcément disparu. Conclure au
-    succès gardait une copie tronquée ou un doublon, journalisé comme un
-    déplacement, et l'annulation était ensuite refusée sans fin."""
+def test_source_injoignable_copie_gardee_sans_etre_journalisee(conn, tmp_path, root, monkeypatch, octets_copies):
+    """Une source qui ne répond plus n'a pas forcément disparu, ni survécu.
+    Journaliser la copie ferait buter l'annulation sans fin sur l'original
+    revenu ; l'effacer perdrait peut-être la seule. Elle est donc gardée, sous
+    un nom qui ne la fait pas passer pour un rangement réussi."""
     source = tmp_path / "Clé"
     fichier = _write(source / "vacances.mp4", "V" * 5000)
     organizer = FileOrganizer(conn, [Rule("Vidéos", "Videos", ["mp4"])], root)
@@ -926,9 +932,103 @@ def test_apply_ne_conclut_pas_au_succes_quand_la_source_est_injoignable(
     organizer.apply(plan)
 
     assert [chemin.name for chemin, _ in organizer.last_failures] == ["vacances.mp4"]
+    assert "copie est conservée" in organizer.last_failures[0][1]
     assert not (root / "Videos" / "vacances.mp4").exists()
-    assert conn.execute("SELECT COUNT(*) AS n FROM file_moves").fetchone()["n"] == 0
-    assert fichier.read_text(encoding="utf-8") == "V" * 5000  # l'original est intact
+    gardee = root / "Videos" / "vacances (copie à vérifier).mp4"
+    assert gardee.read_text(encoding="utf-8") == "V" * octets_copies
+    assert _journal_vide(conn)
+    assert fichier.read_text(encoding="utf-8") == "V" * 5000
+
+
+def test_coupure_reseau_apres_suppression_de_l_original_ne_perd_pas_le_fichier(conn, tmp_path, root, monkeypatch):
+    """Constat bloquant : le partage exécute la suppression de l'original, puis la
+    liaison tombe avant la réponse. L'original n'existe plus ; effacer la copie,
+    faute de pouvoir relire le dossier source, faisait perdre le fichier pour de
+    bon. Rien ne distingue ce cas d'une clé retirée : dans le doute, on garde."""
+    source = tmp_path / "NAS"
+    fichier = _write(source / "contrat.pdf", "C" * 4000)
+    organizer = FileOrganizer(conn, [Rule("Contrats", "Contrats", ["pdf"])], root)
+    plan = organizer.plan(source)
+    vrai_move = _VRAI_MOVE
+    vrai_listdir = os.listdir
+
+    def deplace_puis_liaison_coupee(origine, destination, **extra):
+        vrai_move(origine, destination, **extra)  # copie ET suppression de l'original
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    def listdir_partage_coupe(chemin="."):
+        if str(chemin) == str(source):
+            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+        return vrai_listdir(chemin)
+
+    monkeypatch.setattr(module_files.shutil, "move", deplace_puis_liaison_coupee)
+    monkeypatch.setattr(module_files.os, "listdir", listdir_partage_coupe)
+
+    organizer.apply(plan)
+
+    assert not fichier.exists()  # l'original a bien disparu du partage
+    gardee = root / "Contrats" / "contrat (copie à vérifier).pdf"
+    assert gardee.read_text(encoding="utf-8") == "C" * 4000  # la seule copie survit
+    assert "copie est conservée" in organizer.last_failures[0][1]
+    assert _journal_vide(conn)
+
+
+def test_original_disparu_et_copie_incomplete_la_copie_est_gardee(conn, tmp_path, root, monkeypatch):
+    """L'original a disparu (dossier lisible, fichier absent), mais la copie n'a
+    pas la taille relevée : ce n'est pas un succès, et c'est pourtant la seule
+    trace qui reste. On la garde plutôt que de l'effacer."""
+    source = tmp_path / "Entrée"
+    fichier = _write(source / "rapport.pdf", "R" * 3000)
+    organizer = FileOrganizer(conn, [Rule("PDF", "PDF", ["pdf"])], root)
+    plan = organizer.plan(source)
+
+    def copie_partielle_puis_original_supprime(origine, destination, **_extra):
+        Path(destination).write_text("R" * 1000, encoding="utf-8")
+        Path(origine).unlink()
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(module_files.shutil, "move", copie_partielle_puis_original_supprime)
+
+    organizer.apply(plan)
+
+    assert not fichier.exists()
+    assert (root / "PDF" / "rapport (copie à vérifier).pdf").read_text(encoding="utf-8") == "R" * 1000
+    assert "copie est conservée" in organizer.last_failures[0][1]
+    assert _journal_vide(conn)
+
+
+def test_copie_gardee_sous_son_nom_si_le_renommage_echoue(conn, tmp_path, root, monkeypatch):
+    """Le renommage n'est qu'un signal : s'il échoue, la copie reste sous son nom
+    et le message la désigne, mais rien n'est effacé."""
+    source = tmp_path / "NAS"
+    _write(source / "contrat.pdf", "C" * 4000)
+    organizer = FileOrganizer(conn, [Rule("Contrats", "Contrats", ["pdf"])], root)
+    plan = organizer.plan(source)
+    vrai_move = _VRAI_MOVE
+    vrai_listdir = os.listdir
+
+    def deplace_puis_liaison_coupee(origine, destination, **extra):
+        vrai_move(origine, destination, **extra)
+        raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+
+    def listdir_partage_coupe(chemin="."):
+        if str(chemin) == str(source):
+            raise OSError(64, "Le nom réseau spécifié n'est plus disponible")
+        return vrai_listdir(chemin)
+
+    def renommage_refuse(*_args, **_kwargs):
+        raise PermissionError(13, "Accès refusé")
+
+    monkeypatch.setattr(module_files.shutil, "move", deplace_puis_liaison_coupee)
+    monkeypatch.setattr(module_files.os, "listdir", listdir_partage_coupe)
+    monkeypatch.setattr(module_files.os, "rename", renommage_refuse)
+
+    organizer.apply(plan)
+
+    gardee = root / "Contrats" / "contrat.pdf"
+    assert gardee.read_text(encoding="utf-8") == "C" * 4000
+    assert str(gardee) in organizer.last_failures[0][1]
+    assert _journal_vide(conn)
 
 
 # --- Destinations saisies avec des espaces ou un point final -----------------
@@ -940,18 +1040,34 @@ def test_apply_ne_conclut_pas_au_succes_quand_la_source_est_injoignable(
         ("Documents / Factures", "Documents/Factures"),
         ("  Admin /  Banque  ", "Admin/Banque"),
         ("Documents\\ PDF ", "Documents/PDF"),
+        # Espace insécable : Win32 la conserve, elle peut faire partie du nom.
+        ("Documents/ Factures", "Documents/ Factures"),
+        # Point final : Win32 le retire de chaque segment, de façon cohérente.
+        ("Clients/ACME Inc./Contrats", "Clients/ACME Inc./Contrats"),
     ],
 )
-def test_destination_sans_espaces_autour_des_dossiers(saisie, attendu):
-    """Win32 ne retire les espaces finaux que du dernier segment : « Documents /
+def test_destination_nettoyee_des_espaces_autour_des_dossiers(saisie, attendu):
+    """Win32 ne retire les espaces finales que du dernier segment : « Documents /
     Factures » faisait échouer chaque fichier de la règle sous Windows."""
     assert Rule("Test", saisie, ["pdf"]).destination == attendu
 
 
-@pytest.mark.parametrize("saisie", ["Factures./PDF", "Documents/Archives.", "Documents/ /PDF"])
-def test_destination_refuse_un_point_final_ou_un_dossier_sans_nom(saisie):
-    with pytest.raises(ValueError):
-        Rule("Test", saisie, ["pdf"])
+def test_destination_refuse_un_dossier_sans_nom():
+    with pytest.raises(ValueError, match="sans nom"):
+        Rule("Test", "Documents/ /PDF", ["pdf"])
+
+
+def test_regle_a_point_final_gardee_au_chargement(tmp_path):
+    """Constat : refuser le point final écartait au chargement des règles qui
+    fonctionnaient, et l'éditeur de règles les effaçait ensuite du fichier."""
+    chemin = tmp_path / "regles.json"
+    regle = {"name": "ACME", "destination": "Clients/ACME Inc.", "extensions": [], "patterns": ["*acme*"]}
+    chemin.write_text(json.dumps([regle]), encoding="utf-8")
+
+    rapport = read_rules(chemin)
+
+    assert rapport.errors == []
+    assert [r.destination for r in rapport.rules] == ["Clients/ACME Inc."]
 
 
 def test_iter_files_ecarte_les_dossiers_caches_par_attribut(tmp_path, monkeypatch):

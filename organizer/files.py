@@ -127,11 +127,15 @@ def _clean_destination(destination: str, rule_name: str) -> str:
     pure = PureWindowsPath(raw)
     if pure.drive or pure.root:
         raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » doit être un chemin relatif.")
-    # Win32 retire les espaces et les points finaux du DERNIER segment seulement :
+    # Win32 ne retire les espaces finales que du DERNIER segment d'un chemin :
     # « Documents / Factures » créerait « Documents », puis chercherait
     # « Documents \ Factures » et échouerait pour chaque fichier de la règle.
-    # Les espaces, saisie naturelle autour d'un « / », sont donc retirées ici.
-    parts = [part.strip() for part in pure.parts if part.strip() != "."]
+    # Les espaces autour d'un « / » sont une saisie naturelle : elles sont
+    # retirées. Seulement U+0020 : Win32 conserve l'espace insécable et les
+    # autres blancs, qui peuvent faire partie d'un vrai nom de dossier. Le point
+    # final, lui, est laissé : Win32 le retire de chaque segment de façon
+    # cohérente, à la création comme au déplacement et à l'annulation.
+    parts = [part.strip(" ") for part in pure.parts if part.strip(" ") != "."]
     if any(part == ".." for part in parts):
         raise ValueError(f"Règle « {rule_name} » : la destination « {raw} » ne peut pas contenir « .. ».")
     if any(not part for part in parts):
@@ -139,11 +143,6 @@ def _clean_destination(destination: str, rule_name: str) -> str:
     if not parts:
         raise ValueError(f"Règle « {rule_name} » : la destination ne peut pas être vide.")
     for part in parts:
-        if part.endswith("."):
-            raise ValueError(
-                f"Règle « {rule_name} » : la destination « {raw} » ne peut pas contenir « {part} » : "
-                "Windows ne conserve pas le point final d'un nom de dossier."
-            )
         _check_part(part, raw, rule_name)
     return "/".join(parts)
 
@@ -440,23 +439,36 @@ def _size(path: Path) -> int:
         return 0
 
 
-def _moved_despite_error(source: Path, destination: Path, size: int) -> bool:
-    """Vrai seulement si le déplacement est PROUVÉ malgré l'erreur levée.
+def _source_present(source: Path) -> bool | None:
+    """État de l'original après un déplacement interrompu.
 
-    Une source qui ne répond plus n'a pas forcément disparu : clé USB retirée,
-    partage réseau coupé. Conclure au succès sur ce seul indice garderait une
-    copie tronquée sous le nom canonique, journalisée comme réussie, et
-    l'annulation serait ensuite refusée sans fin. Il faut donc que la
-    destination ait la taille relevée avant le déplacement, et que le dossier
-    source soit lisible et ne contienne plus le fichier.
+    `True` : il est là. `False` : son absence est PROUVÉE, par un dossier source
+    lisible qui ne le contient plus. `None` : on ne sait pas. Une source qui ne
+    répond plus n'a pas forcément disparu (clé USB retirée, partage coupé), et
+    n'est pas forcément intacte non plus : le serveur a pu exécuter la
+    suppression juste avant que la liaison tombe.
     """
-    if not _is_regular(destination) or _size(destination) != size:
-        return False
+    if _is_regular(source):
+        return True
     try:
         names = os.listdir(source.parent)
     except OSError:
-        return False  # dossier injoignable : l'absence de la source n'est pas prouvée
-    return source.name not in names
+        return None
+    return None if source.name in names else False
+
+
+def _mark_uncertain(path: Path, claimed: set[str]) -> Path:
+    """Renomme une copie dont on ignore si elle est complète et si l'original existe encore.
+
+    Sous son nom d'origine, elle passerait pour un rangement réussi ; l'utilisateur
+    pourrait alors supprimer l'original en la croyant fidèle.
+    """
+    try:
+        target = _free_path(path.parent, f"{path.stem} (copie à vérifier){path.suffix}", claimed)
+        os.rename(path, target)
+    except OSError:
+        return path  # renommage impossible : la copie garde son nom, le message la désigne
+    return target
 
 
 def _discard(path: Path) -> None:
@@ -757,16 +769,28 @@ class FileOrganizer:
         size = _size(source)
         try:
             shutil.move(str(source), str(destination))
-        except OSError:
-            if _moved_despite_error(source, destination, size):
-                return destination
-            # Vers un autre volume, `shutil.move` copie puis supprime : une copie
-            # interrompue laisserait à destination un fichier tronqué portant le
-            # nom canonique. `_free_path` a garanti que la place était libre,
-            # donc ce qui s'y trouve vient de cette copie et doit disparaître.
-            # L'original, lui, n'a pas été supprimé.
-            _discard(destination)
-            raise
+        except OSError as error:
+            present = _source_present(source)
+            if present:
+                # Vers un autre volume, `shutil.move` copie puis supprime. L'original
+                # est intact : ce qui se trouve à destination vient de cette copie
+                # (`_free_path` a garanti que la place était libre) et peut disparaître
+                # sans rien perdre, plutôt que de rester tronqué sous le nom canonique.
+                _discard(destination)
+                raise
+            if present is False and _is_regular(destination) and _size(destination) == size:
+                return destination  # déplacement abouti malgré l'erreur : il sera journalisé
+            if not _is_regular(destination):
+                raise
+            # L'original a disparu, ou on ne sait pas : la destination est peut-être la
+            # seule copie qui reste. On n'efface rien (au pire un doublon, jamais une
+            # perte) et on ne journalise pas, sinon l'annulation buterait sans fin sur
+            # un original revenu.
+            kept = _mark_uncertain(destination, claimed)
+            raise OSError(
+                f"{error}. Une copie est conservée à « {kept} » : vérifiez l'original "
+                f"à « {source} » avant de supprimer l'une ou l'autre."
+            ) from error
         return destination
 
     def _journal(self, batch_id: str, source: Path, destination: Path) -> None:
